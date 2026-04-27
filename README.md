@@ -123,7 +123,14 @@ Field access resolves directly from the buffer — only the bytes for the access
 
 ## Interoperability with msgpackr
 
-Data encoded by `structon` can be decoded by a msgpackr `Packr` instance with `randomAccessStructure: true`, as long as the same `typedStructs` array is shared.  To use msgpackr's native struct decoder directly, import msgpackr's `struct.js` side-effect module first and pass the structures through.
+`structon` is bidirectionally byte-compatible with msgpackr's `randomAccessStructure: true` mode (msgpackr ≤ 1.11.10, before its `struct.js` was removed).  The test suite verifies all four directions:
+
+- Structon writes → native `Packr` reads
+- native `Packr` writes → Structon reads
+- byte-identical output for a given plain object
+- mixed types + nested objects round-trip when `structures` and `typedStructs` are shared
+
+These compatibility tests pin msgpackr `1.11.10` as a dev dependency.
 
 ## License
 

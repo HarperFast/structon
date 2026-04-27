@@ -218,39 +218,115 @@ suite('structon – structure persistence', function () {
 	});
 });
 
-// ── binary compatibility with msgpackr struct.js ──────────────────────────────
+// ── binary compatibility with msgpackr's randomAccessStructure ──────────────
+//
+// These tests pin a legacy msgpackr (with struct.js) and verify that bytes
+// flow correctly in BOTH directions:
+//   1. Structon writes  →  native msgpackr reads
+//   2. native msgpackr writes  →  Structon reads
+//
+// msgpackr's struct.js is imported via a relative path because msgpackr's
+// package "exports" map does not expose ./struct.js publicly; the side-effect
+// import registers the read/write hooks on Packr's setWriteStructSlots /
+// setReadStruct globals.
 
-suite('structon – msgpackr binary compatibility', function () {
-	test('bytes produced by Structon are decodable by msgpackr with randomAccessStructure', async function () {
-		// Dynamically import msgpackr's struct.js to register its global hooks,
-		// then use a raw Packr with randomAccessStructure to decode our bytes.
-		let msgpackrStruct;
-		try {
-			msgpackrStruct = await import('msgpackr/struct.js');
-		} catch {
-			// struct.js might not be directly importable in all environments
-			this.skip();
-			return;
-		}
+// Side-effect import: registers msgpackr's struct.js hooks once.
+await import('../node_modules/msgpackr/struct.js');
 
+suite('structon – msgpackr randomAccessStructure round-trip', function () {
+	test('Structon → msgpackr: bytes produced by Structon are decoded by Packr', async function () {
 		const { Packr } = await import('msgpackr');
 
 		const sEnc = new Structon({ structures: [] });
 		const buf = sEnc.encode({ name: 'compat', value: 42 });
 
-		// Structon's recordId is relative to its own typedStructs;
-		// load the same structures into a native Packr instance.
+		// Native Packr with randomAccessStructure reads the same buffer when
+		// given the same structure definitions.
 		const nativePackr = new Packr({
 			structures: [],
 			randomAccessStructure: true,
 		});
 		nativePackr.typedStructs = sEnc.typedStructs;
-		if (nativePackr.typedStructs.transitions)
-			nativePackr.typedStructs.transitions = sEnc.typedStructs.transitions;
 
 		const result = nativePackr.unpack(buf);
 		assert.strictEqual(result.name, 'compat');
 		assert.strictEqual(result.value, 42);
+	});
+
+	test('msgpackr → Structon: bytes produced by Packr (randomAccessStructure) are decoded by Structon', async function () {
+		const { Packr } = await import('msgpackr');
+
+		const nativePackr = new Packr({
+			structures: [],
+			randomAccessStructure: true,
+		});
+		const buf = nativePackr.encode({ id: 7, label: 'native', amount: 1.5 });
+
+		const sEnc = new Structon({ structures: [] });
+		sEnc.typedStructs = nativePackr.typedStructs;
+
+		const result = sEnc.decode(buf);
+		assert.strictEqual(result.id, 7);
+		assert.strictEqual(result.label, 'native');
+		assert.strictEqual(result.amount, 1.5);
+	});
+
+	test('round-trip with mixed types and a nested object', async function () {
+		const { Packr } = await import('msgpackr');
+
+		const sharedStructures = [];
+		const nativePackr = new Packr({
+			structures: sharedStructures,
+			randomAccessStructure: true,
+		});
+
+		const value = {
+			id: 100,
+			name: 'mixed',
+			active: true,
+			ts: new Date('2024-06-15T10:00:00.000Z'),
+			meta: { kind: 'sample', priority: 5 },
+		};
+
+		// msgpackr writes — populates nativePackr.typedStructs (random-access struct
+		// definitions) and nativePackr.structures (msgpack record definitions
+		// used for the nested object).
+		const buf = nativePackr.encode(value);
+
+		// Structon reads.  We pass the same `structures` array so msgpackr's
+		// inner unpack can resolve the record id used for the nested object.
+		const sEnc = new Structon({ structures: nativePackr.structures });
+		sEnc.typedStructs = nativePackr.typedStructs;
+
+		const result = sEnc.decode(buf);
+		assert.strictEqual(result.id, 100);
+		assert.strictEqual(result.name, 'mixed');
+		assert.strictEqual(result.active, true);
+		assert.ok(result.ts instanceof Date);
+		assert.strictEqual(result.ts.getTime(), value.ts.getTime());
+		assert.strictEqual(result.meta.kind, 'sample');
+		assert.strictEqual(result.meta.priority, 5);
+	});
+
+	test('Structon and msgpackr produce byte-identical output for the same input', async function () {
+		const { Packr } = await import('msgpackr');
+
+		const value = { x: 5, label: 'hello', flag: true };
+
+		const sEnc = new Structon({ structures: [] });
+		const sBuf = sEnc.encode(value);
+
+		const nativePackr = new Packr({
+			structures: [],
+			randomAccessStructure: true,
+		});
+		const nBuf = nativePackr.encode(value);
+
+		assert.deepStrictEqual(
+			Array.from(sBuf),
+			Array.from(nBuf),
+			'Structon and msgpackr should emit identical byte sequences for the same plain object'
+		);
 	});
 });
 
