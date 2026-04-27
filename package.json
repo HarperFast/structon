@@ -1,0 +1,46 @@
+{
+  "name": "structon",
+  "version": "0.1.0",
+  "description": "Random-access struct encoding/decoding as an extensible class for msgpackr, cbor-x, and compatible encoders",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/node.cjs",
+  "module": "./index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "require": "./dist/node.cjs"
+    }
+  },
+  "types": "./index.d.ts",
+  "scripts": {
+    "test": "mocha tests/test.js -u tdd --experimental-json-modules",
+    "build": "rollup -c"
+  },
+  "keywords": [
+    "msgpack",
+    "cbor",
+    "struct",
+    "random-access",
+    "binary",
+    "encoding",
+    "serialization"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HarperFast/structon"
+  },
+  "author": "Kris Zyp",
+  "peerDependencies": {
+    "msgpackr": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "msgpackr": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "mocha": "^10.0.0",
+    "msgpackr": "^1.11.0"
+  }
+}
