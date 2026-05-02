@@ -33,7 +33,7 @@
   },
   "author": "Kris Zyp",
   "peerDependencies": {
-    "msgpackr": ">=1.0.0"
+    "msgpackr": ">=2.0.1"
   },
   "peerDependenciesMeta": {
     "msgpackr": {
