@@ -13,10 +13,17 @@
     }
   },
   "types": "./index.d.ts",
+  "files": [
+    "dist",
+    "index.js",
+    "struct.js",
+    "index.d.ts"
+  ],
   "scripts": {
     "test": "mocha tests/test*.js -u tdd --experimental-json-modules",
     "benchmark": "node tests/benchmark.js",
-    "build": "rollup -c"
+    "build": "rollup -c",
+    "prepare": "rollup -c"
   },
   "keywords": [
     "msgpack",
