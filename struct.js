@@ -1077,8 +1077,20 @@ export function readStruct(src, position, srcEnd) {
  */
 export function onLoadedStructures(sharedData) {
 	if (!(sharedData instanceof Map)) return;
+	let named = sharedData.get('named') || [];
 	let typed = sharedData.get('typed') || [];
 	if (Object.isFrozen(typed)) typed = typed.map(s => s.slice(0));
+
+	// Reload named structures so msgpackr's length tracking stays in sync.
+	// Clearing transitions forces msgpackr to rebuild them and update lastNamedStructuresLength.
+	// Unfreeze elements since msgpackr lazily adds a `read` property to each structure entry.
+	const prevStructures = this.structures;
+	this.structures = named.map(s => Object.isFrozen(s) ? s.slice() : s);
+	this.structures.sharedLength = named.length;
+	if (prevStructures && prevStructures.transitions) {
+		// Mark as needing transition rebuild so msgpackr resets lastNamedStructuresLength
+		delete this.structures.transitions;
+	}
 
 	const transitions = Object.create(null);
 	for (let i = 0, l = typed.length; i < l; i++) {
