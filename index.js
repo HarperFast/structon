@@ -4,26 +4,23 @@ import {
 	SOURCE_SYMBOL,
 } from './struct.js';
 
-// Track which BaseClasses have had hooks registered so we don't re-register.
-const _hooksRegistered = new WeakSet();
-
 /**
  * Creates a class that extends `BaseClass` (msgpackr's Packr or cbor-x's Encoder)
  * and adds random-access struct encoding/decoding.
  *
  * Two encoding paths are supported:
  *
- *  - **Fast path** (msgpackr ≥ 2.0.1 with `setWriteStructSlots` / `setReadStruct`):
- *    structon registers its writeStruct as a hook in msgpackr's encoder so that
- *    plain objects are written directly into msgpackr's shared target buffer.
- *    No intermediate allocations.  Detected automatically by checking for
- *    `BaseClass.setWriteStructSlots`.
+ *  - **Fast path** (BaseClass advertises `SUPPORTS_STRUCT_HOOKS`):  structon
+ *    sets per-instance hook methods (`_writeStruct`, `_readStruct`, …) which
+ *    the BaseClass's encode/decode pipeline dispatches to.  The struct is
+ *    written directly into the BaseClass's shared target buffer with no
+ *    intermediate allocations.
  *
- *  - **Standalone path** (cbor-x, msgpackr without hooks):
- *    structon wraps `encode`/`decode` and uses its own pre-allocated work
- *    buffers, returning a fresh Uint8Array per encode call.
+ *  - **Standalone path** (any other base):  structon wraps `encode`/`decode`
+ *    and uses its own pre-allocated work buffers, returning a fresh
+ *    `Uint8Array` per encode call.
  *
- * Either way, the binary format is identical to msgpackr's struct.js.
+ * The on-the-wire binary format is identical in both paths.
  *
  * @param {class} BaseClass  - msgpackr Packr / Encoder or cbor-x Encoder
  * @returns {class} Structon subclass
@@ -32,17 +29,10 @@ export function createStructon(BaseClass) {
 	const _baseDecode = BaseClass.prototype.decode;
 	const _baseUnpack = BaseClass.prototype.unpack || null;
 
-	// Detect the msgpackr fast path: msgpackr ≥ 2.0.1 exposes setWriteStructSlots
-	// as a static on Packr (and setReadStruct on Unpackr).
-	const setWriteStructSlots = BaseClass.setWriteStructSlots;
-	const setReadStruct = findStaticOnChain(BaseClass, 'setReadStruct');
-	const fastPath = typeof setWriteStructSlots === 'function' && typeof setReadStruct === 'function';
-
-	if (fastPath && !_hooksRegistered.has(BaseClass)) {
-		setWriteStructSlots(writeStructInPlace, prepareStructures);
-		setReadStruct(readStruct, onLoadedStructures, saveState);
-		_hooksRegistered.add(BaseClass);
-	}
+	// A BaseClass advertises hook support via a static `SUPPORTS_STRUCT_HOOKS`
+	// flag (set by msgpackr ≥ 2.0.1, cbor-x post-update, etc.).  Walking the
+	// prototype chain lets a Packr subclass be passed in unchanged.
+	const fastPath = lookupStatic(BaseClass, 'SUPPORTS_STRUCT_HOOKS') === true;
 
 	class Structon extends BaseClass {
 		constructor(options = {}) {
@@ -52,9 +42,13 @@ export function createStructon(BaseClass) {
 			if (!this.typedStructs) this.typedStructs = [];
 
 			if (fastPath) {
-				// Opt this instance into struct encoding/decoding via the hooks.
-				this._useStructEncoding = true;
-				// No encode/decode wrappers needed — msgpackr's pipeline handles it.
+				// Set per-instance hook methods.  The BaseClass's encode/decode
+				// pipeline picks these up automatically.
+				this._writeStruct = writeStructInPlace;
+				this._readStruct = readStruct;
+				this._onLoadedStructures = onLoadedStructures;
+				this._onSaveState = saveState;
+				this._prepareStructures = prepareStructures;
 				return;
 			}
 
@@ -89,8 +83,8 @@ export function createStructon(BaseClass) {
 		}
 
 		decode(source) {
-			// Fast path: let msgpackr's checkedRead dispatch via the readStruct hook.
-			if (this._useStructEncoding) return _baseDecode.call(this, source);
+			// Fast path: let the BaseClass's checkedRead dispatch via _readStruct.
+			if (fastPath) return _baseDecode.call(this, source);
 
 			// Standalone path: intercept top-level struct bytes ourselves.
 			const src = toUint8Array(source);
@@ -98,7 +92,7 @@ export function createStructon(BaseClass) {
 				const recordId = peekRecordId(src);
 				this._ensureTypedStructures();
 				if (recordId !== -1 && this.typedStructs && this.typedStructs[recordId]) {
-					return readStruct(src, 0, src.length, this);
+					return readStruct.call(this, src, 0, src.length);
 				}
 			}
 			return _baseDecode.call(this, source);
@@ -107,14 +101,14 @@ export function createStructon(BaseClass) {
 		/**
 		 * Decode bytes from src[start..end) — used by readStruct's OBJECT_DATA
 		 * getters when the base class doesn't support unpack(src, {start, end})
-		 * (e.g. cbor-x).
+		 * (e.g. cbor-x without hook support).
 		 */
 		_decodeSliceDirect(src, start, end) {
 			if (end > start && src[start] >= 0x20 && src[start] < 0x40) {
 				const slice = src.subarray ? src.subarray(start, end) : src.slice(start, end);
 				const recordId = peekRecordId(slice);
 				if (recordId !== -1 && this.typedStructs && this.typedStructs[recordId]) {
-					return readStruct(slice, 0, slice.length, this);
+					return readStruct.call(this, slice, 0, slice.length);
 				}
 			}
 			if (_baseUnpack) return _baseUnpack.call(this, src, { start, end });
@@ -146,10 +140,9 @@ export function createStructon(BaseClass) {
 			}
 		}
 
-		// Compatibility shim used by msgpackr's internal _mergeStructures path on
-		// the standalone (non-fast) path.  On the fast path msgpackr now installs
-		// onLoadedStructures via setReadStruct and calls it directly.
 		_mergeStructures(loadedStructures) {
+			// On the fast path the BaseClass already calls _onLoadedStructures
+			// itself; only the standalone path needs to invoke it manually.
 			if (!fastPath && loadedStructures) onLoadedStructures.call(this, loadedStructures);
 			if (super._mergeStructures) return super._mergeStructures(loadedStructures);
 		}
@@ -163,13 +156,13 @@ export function createStructon(BaseClass) {
 	return Structon;
 }
 
-function findStaticOnChain(cls, name) {
+function lookupStatic(cls, name) {
 	let c = cls;
 	while (c) {
-		if (typeof c[name] === 'function') return c[name];
+		if (Object.prototype.hasOwnProperty.call(c, name)) return c[name];
 		c = Object.getPrototypeOf(c);
 	}
-	return null;
+	return undefined;
 }
 
 function toUint8Array(source) {

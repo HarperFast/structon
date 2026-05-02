@@ -228,24 +228,25 @@ function _writeHeader(result, recordId, headerSize) {
 }
 
 /**
- * Fast path used by msgpackr's `setWriteStructSlots` hook: writes the struct
- * directly into msgpackr's shared target buffer at the given position.  Avoids
- * the per-field allocations of the standalone writeStruct.
+ * Fast path: writes a struct directly into the BaseClass's shared target
+ * buffer at the given position.  Avoids the per-field allocations of the
+ * standalone writeStruct.
  *
- * Signature matches msgpackr's writeStructSlots contract (mirrors what
- * struct.js used to do in msgpackr v1.x):
+ * Designed to be assigned to a Packr/Encoder instance as `_writeStruct`.
+ * The BaseClass's encode pipeline calls it as a method, so `this` is the
+ * encoder instance (provides `typedStructs`).
  *
  * @param {object} object
  * @param {Uint8Array|Buffer} target  - shared encoding buffer
  * @param {number} encodingStart      - start of this encoding within target
  * @param {number} position           - current write position in target
- * @param {Array}  structures         - msgpackr's named-records array (unused here)
+ * @param {Array}  structures         - BaseClass's named-records array (unused)
  * @param {function} makeRoom         - grow target; returns new target
  * @param {function} pack             - pack a nested value at a given position
- * @param {object} packr              - the encoder instance
- * @returns {number} new write position, or 0 to bail (fall back to msgpack object)
+ * @returns {number} new write position, or 0 to bail (fall back to plain object)
  */
-export function writeStructInPlace(object, target, encodingStart, position, structures, makeRoom, pack, packr) {
+export function writeStructInPlace(object, target, encodingStart, position, structures, makeRoom, pack) {
+	const packr = this;
 	let typedStructs = packr.typedStructs || (packr.typedStructs = []);
 	let targetView = target.dataView;
 	let refsStartPosition = (typedStructs.lastStringStart || 100) + position;
@@ -561,7 +562,7 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 		if (refsStartPosition === refPosition) return position; // no refs
 		// fixed section overflowed our estimate — retry with the corrected size
 		typedStructs.lastStringStart = position - start;
-		return writeStructInPlace(object, target, encodingStart, start, structures, makeRoom, pack, packr);
+		return writeStructInPlace.call(packr, object, target, encodingStart, start, structures, makeRoom, pack);
 	}
 	return refPosition;
 }
@@ -845,13 +846,17 @@ function _encode(object, encodeNested, packr, work) {
 /**
  * Decode a random-access struct.
  *
+ * Designed to be assigned to a Packr/Unpackr instance as `_readStruct`.  Call
+ * via `unpackr._readStruct(src, pos, end)` so that `this === unpackr`, or
+ * via `readStruct.call(unpackr, src, pos, end)` from the standalone path.
+ *
  * @param {Uint8Array} src
  * @param {number} position  - byte offset of the struct header in src
  * @param {number} srcEnd    - exclusive end byte
- * @param {object} unpackr   - must implement _decodeSliceDirect(src, start, end)
  * @returns lazy object with property getters
  */
-export function readStruct(src, position, srcEnd, unpackr) {
+export function readStruct(src, position, srcEnd) {
+	const unpackr = this;
 	let recordId = src[position++] - 0x20;
 	if (recordId >= 24) {
 		switch (recordId) {
@@ -964,11 +969,11 @@ export function readStruct(src, position, srcEnd, unpackr) {
 							return readString(source.bytes, ref + refStart, end - ref);
 						}
 						// Prefer msgpackr's unpack(src, {start, end}) when available — it dispatches
-						// struct bytes through the registered readStruct hook, supporting nested
+						// struct bytes through the registered _readStruct hook, supporting nested
 						// structs inside arrays/records.  Falls back to _decodeSliceDirect for
-						// base classes (cbor-x) that don't accept start/end options on unpack.
+						// base classes that don't support struct hooks (e.g. cbor-x today).
 						if (typeof unpackr.unpack === 'function' && unpackr.constructor &&
-							typeof unpackr.constructor.setReadStruct === 'function') {
+							unpackr.constructor.SUPPORTS_STRUCT_HOOKS) {
 							currentSource = source;
 							try {
 								return unpackr.unpack(source.bytes, { start: ref + refStart, end: end + refStart });
