@@ -28,6 +28,25 @@ const float32Headers = [false, true, true, false, false, true, true, false];
 export const RECORD_SYMBOL = Symbol('record-id');
 export const SOURCE_SYMBOL = Symbol.for('source');
 
+// Tracks the source being decoded by a nested unpack call so that
+// `saveState` can detach it from the parent decoder's buffer state.
+let currentSource;
+
+/**
+ * Called (bound to the decoder) when msgpackr saves its decoder state — e.g.
+ * during a nested unpack call.  If we're in the middle of reading a struct's
+ * OBJECT_DATA field, slice the lazy struct's bytes so it remains self-contained
+ * after the parent decoder's globals are clobbered.
+ */
+export function saveState() {
+	if (currentSource) {
+		currentSource.bytes = Uint8Array.prototype.slice.call(currentSource.bytes, currentSource.position, currentSource.bytesEnd);
+		currentSource.position = 0;
+		currentSource.bytesEnd = currentSource.bytes.length;
+		currentSource = null;
+	}
+}
+
 // Multiplier table for float32 significant-digit rounding (matches msgpackr/unpack.js)
 export const mult10 = new Array(256);
 for (let i = 0; i < 256; i++) {
@@ -37,18 +56,23 @@ for (let i = 0; i < 256; i++) {
 let evalSupported;
 try { new Function(''); evalSupported = true; } catch (e) { /* sandboxed */ }
 
-let _textEncoder;
-try { _textEncoder = new TextEncoder(); } catch (e) { /* not available */ }
-
 let _textDecoder;
 try { _textDecoder = new TextDecoder(); } catch (e) { /* not available */ }
 
-function utf8Encode(str) {
-	if (typeof Buffer !== 'undefined') {
-		const b = Buffer.from(str, 'utf8');
-		return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
-	}
-	if (_textEncoder) return _textEncoder.encode(str);
+// ── UTF-8 encoding helpers ────────────────────────────────────────────────────
+
+const _hasNodeBuffer = typeof Buffer !== 'undefined';
+
+// TextEncoder.encodeInto writes directly into a target buffer (no allocation).
+const _encodeInto = (() => {
+	if (_hasNodeBuffer) return null; // prefer Buffer.utf8Write on Node.js
+	try {
+		const te = new TextEncoder();
+		return te.encodeInto ? (s, buf) => te.encodeInto(s, buf).written : null;
+	} catch (e) { return null; }
+})();
+
+function utf8EncodeFallback(str) {
 	const bytes = [];
 	for (let i = 0; i < str.length; i++) {
 		const c = str.charCodeAt(i);
@@ -60,7 +84,7 @@ function utf8Encode(str) {
 }
 
 export function readString(src, start, length) {
-	if (typeof Buffer !== 'undefined') {
+	if (_hasNodeBuffer) {
 		const b = Buffer.isBuffer(src)
 			? src
 			: Buffer.from(src.buffer, src.byteOffset, src.byteLength);
@@ -105,36 +129,474 @@ function createTypeTransition(transition, type, size) {
 	return t;
 }
 
-// Try to encode null/undefined into an existing fixed-width slot via CBOR constants.
-// Returns {transition, bytes} or null if no existing slot found.
-function anyTypeFixed(transition, value /* -10=null, -9=undefined */) {
+// ── Work-buffer pool (one pair per nesting depth) ─────────────────────────────
+//
+// Instead of allocating a new Uint8Array for each field value, we write
+// directly into pre-allocated work buffers.  A per-depth pool means nested
+// struct encoding (from encodeNested) uses a separate set of buffers and
+// never clobbers the outer call's state.
+
+const INITIAL_FIXED = 4096;
+const INITIAL_REFS  = 65536;
+const _pool = [];
+let   _depth = 0;
+
+function _getWork() {
+	let w = _pool[_depth];
+	if (!w) {
+		const fb = _hasNodeBuffer ? Buffer.allocUnsafe(INITIAL_FIXED) : new Uint8Array(INITIAL_FIXED);
+		const rb = _hasNodeBuffer ? Buffer.allocUnsafe(INITIAL_REFS)  : new Uint8Array(INITIAL_REFS);
+		_pool[_depth] = w = {
+			fixedBuf: fb,
+			fixedView: new DataView(fb.buffer, fb.byteOffset || 0, INITIAL_FIXED),
+			refsBuf: rb,
+		};
+	}
+	return w;
+}
+
+function _growFixed(w, need) {
+	const size = Math.max(w.fixedBuf.length * 2, need);
+	const nb = _hasNodeBuffer ? Buffer.allocUnsafe(size) : new Uint8Array(size);
+	nb.set(w.fixedBuf.subarray(0, w.fixedBuf.length));
+	w.fixedBuf = nb;
+	w.fixedView = new DataView(nb.buffer, nb.byteOffset || 0, size);
+}
+
+function _growRefs(w, need) {
+	const size = Math.max(w.refsBuf.length * 2, w.refsBuf.length + need);
+	const nb = _hasNodeBuffer ? Buffer.allocUnsafe(size) : new Uint8Array(size);
+	nb.set(w.refsBuf);
+	w.refsBuf = nb;
+}
+
+// Write a string directly into w.refsBuf at refsPos; return updated refsPos.
+function _writeStr(w, refsPos, value) {
+	const need = value.length * 3;
+	if (refsPos + need > w.refsBuf.length) _growRefs(w, need);
+	if (_hasNodeBuffer) return refsPos + w.refsBuf.utf8Write(value, refsPos);
+	if (_encodeInto)    return refsPos + _encodeInto(value, w.refsBuf.subarray(refsPos));
+	const bytes = utf8EncodeFallback(value);
+	w.refsBuf.set(bytes, refsPos);
+	return refsPos + bytes.length;
+}
+
+// Try to encode null/undefined into an existing fixed-width slot.
+// Returns the matching transition node on success, null on failure.
+// Updates _anyPos with the new fixedPos.
+let _anyPos = 0;
+function _anyTypeFixed(w, transition, fixedPos, value /* -10=null, -9=undefined */) {
 	let next;
 	if ((next = transition.ascii8 || transition.num8)) {
-		const b = new Uint8Array(1);
-		new DataView(b.buffer).setInt8(0, value);
-		return { transition: next, bytes: b };
+		w.fixedView.setInt8(fixedPos, value);
+		_anyPos = fixedPos + 1;
+		return next;
 	}
 	if ((next = transition.string16 || transition.object16)) {
-		const b = new Uint8Array(2);
-		new DataView(b.buffer).setInt16(0, value, true);
-		return { transition: next, bytes: b };
+		w.fixedView.setInt16(fixedPos, value, true);
+		_anyPos = fixedPos + 2;
+		return next;
 	}
 	if ((next = transition.num32)) {
-		const b = new Uint8Array(4);
-		new DataView(b.buffer).setUint32(0, 0xe0000100 + value, true);
-		return { transition: next, bytes: b };
+		w.fixedView.setUint32(fixedPos, 0xe0000100 + value, true);
+		_anyPos = fixedPos + 4;
+		return next;
 	}
 	if ((next = transition.num64)) {
-		const b = new Uint8Array(8);
-		new DataView(b.buffer).setFloat64(0, NaN, true);
-		new DataView(b.buffer).setInt8(0, value);
-		return { transition: next, bytes: b };
+		w.fixedView.setFloat64(fixedPos, NaN, true);
+		w.fixedView.setInt8(fixedPos, value);
+		_anyPos = fixedPos + 8;
+		return next;
 	}
 	return null;
 }
 
+function _writeHeader(result, recordId, headerSize) {
+	switch (headerSize) {
+		case 1: result[0] = recordId + 0x20; break;
+		case 2: result[0] = 0x38; result[1] = recordId; break;
+		case 3: {
+			result[0] = 0x39;
+			new DataView(result.buffer, result.byteOffset || 0).setUint16(1, recordId, true);
+			break;
+		}
+		case 4: {
+			new DataView(result.buffer, result.byteOffset || 0).setUint32(0, (recordId << 8) + 0x3a, true);
+			break;
+		}
+	}
+}
+
 /**
- * Encode `object` as a random-access struct.
+ * Fast path used by msgpackr's `setWriteStructSlots` hook: writes the struct
+ * directly into msgpackr's shared target buffer at the given position.  Avoids
+ * the per-field allocations of the standalone writeStruct.
+ *
+ * Signature matches msgpackr's writeStructSlots contract (mirrors what
+ * struct.js used to do in msgpackr v1.x):
+ *
+ * @param {object} object
+ * @param {Uint8Array|Buffer} target  - shared encoding buffer
+ * @param {number} encodingStart      - start of this encoding within target
+ * @param {number} position           - current write position in target
+ * @param {Array}  structures         - msgpackr's named-records array (unused here)
+ * @param {function} makeRoom         - grow target; returns new target
+ * @param {function} pack             - pack a nested value at a given position
+ * @param {object} packr              - the encoder instance
+ * @returns {number} new write position, or 0 to bail (fall back to msgpack object)
+ */
+export function writeStructInPlace(object, target, encodingStart, position, structures, makeRoom, pack, packr) {
+	let typedStructs = packr.typedStructs || (packr.typedStructs = []);
+	let targetView = target.dataView;
+	let refsStartPosition = (typedStructs.lastStringStart || 100) + position;
+	let safeEnd = target.length - 10;
+	let start = position;
+	if (position > safeEnd) {
+		target = makeRoom(position);
+		targetView = target.dataView;
+		position -= encodingStart;
+		start -= encodingStart;
+		refsStartPosition -= encodingStart;
+		encodingStart = 0;
+		safeEnd = target.length - 10;
+	}
+
+	let refOffset, refPosition = refsStartPosition;
+	let transition = typedStructs.transitions || (typedStructs.transitions = Object.create(null));
+	let nextId = typedStructs.length;
+	let headerSize =
+		nextId < 0xf      ? 1 :
+		nextId < 0xf0     ? 2 :
+		nextId < 0xf000   ? 3 :
+		nextId < 0xf00000 ? 4 : 0;
+	if (headerSize === 0) return 0;
+	position += headerSize;
+
+	const queuedReferences = [];
+	let usedAscii0 = false;
+	let keyIndex = 0;
+
+	for (let key in object) {
+		let value = object[key];
+		let nextTransition = transition[key];
+		if (!nextTransition) {
+			transition[key] = nextTransition = {
+				key, parent: transition, enumerationOffset: 0,
+				ascii0: null, ascii8: null, num8: null,
+				string16: null, object16: null, num32: null,
+				float64: null, date64: null,
+			};
+		}
+		if (position > safeEnd) {
+			target = makeRoom(position);
+			targetView = target.dataView;
+			position -= encodingStart;
+			start -= encodingStart;
+			refsStartPosition -= encodingStart;
+			refPosition -= encodingStart;
+			encodingStart = 0;
+			safeEnd = target.length - 10;
+		}
+		switch (typeof value) {
+			case 'number': {
+				const number = value;
+				if (nextId < 200 || !nextTransition.num64) {
+					if (number >> 0 === number && number < 0x20000000 && number > -0x1f000000) {
+						if (
+							number < 0xf6 && number >= 0 &&
+							(nextTransition.num8 && !(nextId > 200 && nextTransition.num32) ||
+							 number < 0x20 && !nextTransition.num32)
+						) {
+							transition = nextTransition.num8 || createTypeTransition(nextTransition, NUMBER, 1);
+							target[position++] = number;
+						} else {
+							transition = nextTransition.num32 || createTypeTransition(nextTransition, NUMBER, 4);
+							targetView.setUint32(position, number, true);
+							position += 4;
+						}
+						break;
+					} else if (number < 0x100000000 && number >= -0x80000000) {
+						targetView.setFloat32(position, number, true);
+						if (float32Headers[target[position + 3] >>> 5]) {
+							let xShifted;
+							if (((xShifted = number * mult10[((target[position + 3] & 0x7f) << 1) | (target[position + 2] >> 7)]) >> 0) === xShifted) {
+								transition = nextTransition.num32 || createTypeTransition(nextTransition, NUMBER, 4);
+								position += 4;
+								break;
+							}
+						}
+					}
+				}
+				transition = nextTransition.num64 || createTypeTransition(nextTransition, NUMBER, 8);
+				targetView.setFloat64(position, number, true);
+				position += 8;
+				break;
+			}
+			case 'string': {
+				const strLength = value.length;
+				refOffset = refPosition - refsStartPosition;
+				if ((strLength << 2) + refPosition > safeEnd) {
+					target = makeRoom((strLength << 2) + refPosition);
+					targetView = target.dataView;
+					position -= encodingStart;
+					start -= encodingStart;
+					refsStartPosition -= encodingStart;
+					refPosition -= encodingStart;
+					encodingStart = 0;
+					safeEnd = target.length - 10;
+				}
+				if (strLength > ((0xff00 + refOffset) >> 2)) {
+					queuedReferences.push(key, value, position - start);
+					break;
+				}
+				let isNotAscii;
+				let strStart = refPosition;
+				if (strLength < 0x40) {
+					let i, c1, c2;
+					for (i = 0; i < strLength; i++) {
+						c1 = value.charCodeAt(i);
+						if (c1 < 0x80) {
+							target[refPosition++] = c1;
+						} else if (c1 < 0x800) {
+							isNotAscii = true;
+							target[refPosition++] = c1 >> 6 | 0xc0;
+							target[refPosition++] = c1 & 0x3f | 0x80;
+						} else if (
+							(c1 & 0xfc00) === 0xd800 &&
+							((c2 = value.charCodeAt(i + 1)) & 0xfc00) === 0xdc00
+						) {
+							isNotAscii = true;
+							c1 = 0x10000 + ((c1 & 0x03ff) << 10) + (c2 & 0x03ff);
+							i++;
+							target[refPosition++] = c1 >> 18 | 0xf0;
+							target[refPosition++] = c1 >> 12 & 0x3f | 0x80;
+							target[refPosition++] = c1 >> 6  & 0x3f | 0x80;
+							target[refPosition++] = c1       & 0x3f | 0x80;
+						} else {
+							isNotAscii = true;
+							target[refPosition++] = c1 >> 12 | 0xe0;
+							target[refPosition++] = c1 >> 6 & 0x3f | 0x80;
+							target[refPosition++] = c1      & 0x3f | 0x80;
+						}
+					}
+				} else if (_hasNodeBuffer) {
+					refPosition += target.utf8Write(value, refPosition, target.byteLength - refPosition);
+					isNotAscii = refPosition - strStart > strLength;
+				} else if (_encodeInto) {
+					refPosition += _encodeInto(value, target.subarray(refPosition));
+					isNotAscii = refPosition - strStart > strLength;
+				} else {
+					const bytes = utf8EncodeFallback(value);
+					target.set(bytes, refPosition);
+					refPosition += bytes.length;
+					isNotAscii = bytes.length > strLength;
+				}
+				if (refOffset < 0xa0 || (refOffset < 0xf6 && (nextTransition.ascii8 || nextTransition.string8))) {
+					if (isNotAscii) {
+						if (!(transition = nextTransition.string8)) {
+							if (typedStructs.length > 10 && (transition = nextTransition.ascii8)) {
+								transition.__type = UTF8;
+								nextTransition.ascii8 = null;
+								nextTransition.string8 = transition;
+								pack(null, 0, true); // notify structure update
+							} else {
+								transition = createTypeTransition(nextTransition, UTF8, 1);
+							}
+						}
+					} else if (refOffset === 0 && !usedAscii0) {
+						usedAscii0 = true;
+						transition = nextTransition.ascii0 || createTypeTransition(nextTransition, ASCII, 0);
+						break; // size=0: don't increment position
+					} else if (!(transition = nextTransition.ascii8) &&
+							   !(typedStructs.length > 10 && (transition = nextTransition.string8))) {
+						transition = createTypeTransition(nextTransition, ASCII, 1);
+					}
+					target[position++] = refOffset;
+				} else {
+					transition = nextTransition.string16 || createTypeTransition(nextTransition, UTF8, 2);
+					targetView.setUint16(position, refOffset, true);
+					position += 2;
+				}
+				break;
+			}
+			case 'object': {
+				if (value) {
+					if (value.constructor === Date) {
+						transition = nextTransition.date64 || createTypeTransition(nextTransition, DATE, 8);
+						targetView.setFloat64(position, value.getTime(), true);
+						position += 8;
+					} else {
+						queuedReferences.push(key, value, keyIndex);
+					}
+				} else {
+					nextTransition = anyTypeInPlace(nextTransition, position, targetView, -10);
+					if (nextTransition) {
+						transition = nextTransition;
+						position = updatedPosition;
+					} else {
+						queuedReferences.push(key, value, keyIndex);
+					}
+				}
+				break;
+			}
+			case 'boolean':
+				transition = nextTransition.num8 || nextTransition.ascii8 || createTypeTransition(nextTransition, NUMBER, 1);
+				target[position++] = value ? 0xf9 : 0xf8;
+				break;
+			case 'undefined': {
+				nextTransition = anyTypeInPlace(nextTransition, position, targetView, -9);
+				if (nextTransition) {
+					transition = nextTransition;
+					position = updatedPosition;
+				} else {
+					queuedReferences.push(key, value, keyIndex);
+				}
+				break;
+			}
+			default:
+				queuedReferences.push(key, value, keyIndex);
+		}
+		keyIndex++;
+	}
+
+	for (let i = 0, l = queuedReferences.length; i < l;) {
+		let key = queuedReferences[i++];
+		let value = queuedReferences[i++];
+		let propertyIndex = queuedReferences[i++];
+		let nextTransition = transition[key];
+		if (!nextTransition) {
+			transition[key] = nextTransition = {
+				key, parent: transition,
+				enumerationOffset: propertyIndex - keyIndex,
+				ascii0: null, ascii8: null, num8: null,
+				string16: null, object16: null, num32: null,
+				float64: null, date64: null,
+			};
+		}
+		let newPosition;
+		if (value) {
+			let size;
+			refOffset = refPosition - refsStartPosition;
+			if (refOffset < 0xff00) {
+				transition = nextTransition.object16;
+				if (transition) size = 2;
+				else if ((transition = nextTransition.object32)) size = 4;
+				else { transition = createTypeTransition(nextTransition, OBJECT_DATA, 2); size = 2; }
+			} else {
+				transition = nextTransition.object32 || createTypeTransition(nextTransition, OBJECT_DATA, 4);
+				size = 4;
+			}
+			newPosition = pack(value, refPosition);
+			if (typeof newPosition === 'object') {
+				// re-allocated buffer — refresh local refs
+				refPosition = newPosition.position;
+				targetView = newPosition.targetView;
+				target = newPosition.target;
+				refsStartPosition -= encodingStart;
+				position -= encodingStart;
+				start -= encodingStart;
+				encodingStart = 0;
+			} else {
+				refPosition = newPosition;
+			}
+			if (size === 2) { targetView.setUint16(position, refOffset, true); position += 2; }
+			else            { targetView.setUint32(position, refOffset, true); position += 4; }
+		} else { // null or undefined
+			transition = nextTransition.object16 || createTypeTransition(nextTransition, OBJECT_DATA, 2);
+			targetView.setInt16(position, value === null ? -10 : -9, true);
+			position += 2;
+		}
+		keyIndex++;
+	}
+
+	let recordId = transition[RECORD_SYMBOL];
+	if (recordId == null) {
+		recordId = packr.typedStructs.length;
+		const structure = [];
+		let nextTransition = transition;
+		let key, type;
+		while ((type = nextTransition.__type) !== undefined) {
+			let size = nextTransition.__size;
+			nextTransition = nextTransition.__parent;
+			key = nextTransition.key;
+			let property = [type, size, key];
+			if (nextTransition.enumerationOffset) property.push(nextTransition.enumerationOffset);
+			structure.push(property);
+			nextTransition = nextTransition.parent;
+		}
+		structure.reverse();
+		transition[RECORD_SYMBOL] = recordId;
+		packr.typedStructs[recordId] = structure;
+		pack(null, 0, true); // notify structure update
+	}
+
+	switch (headerSize) {
+		case 1:
+			if (recordId >= 0x10) return 0;
+			target[start] = recordId + 0x20;
+			break;
+		case 2:
+			if (recordId >= 0x100) return 0;
+			target[start] = 0x38;
+			target[start + 1] = recordId;
+			break;
+		case 3:
+			if (recordId >= 0x10000) return 0;
+			target[start] = 0x39;
+			targetView.setUint16(start + 1, recordId, true);
+			break;
+		case 4:
+			if (recordId >= 0x1000000) return 0;
+			targetView.setUint32(start, (recordId << 8) + 0x3a, true);
+			break;
+	}
+
+	if (position < refsStartPosition) {
+		if (refsStartPosition === refPosition) return position; // no refs
+		// compact: shift ref bytes left to immediately follow fixed section
+		target.copyWithin(position, refsStartPosition, refPosition);
+		refPosition += position - refsStartPosition;
+		typedStructs.lastStringStart = position - start;
+	} else if (position > refsStartPosition) {
+		if (refsStartPosition === refPosition) return position; // no refs
+		// fixed section overflowed our estimate — retry with the corrected size
+		typedStructs.lastStringStart = position - start;
+		return writeStructInPlace(object, target, encodingStart, start, structures, makeRoom, pack, packr);
+	}
+	return refPosition;
+}
+
+let updatedPosition;
+function anyTypeInPlace(transition, position, targetView, value) {
+	let next;
+	if ((next = transition.ascii8 || transition.num8)) {
+		targetView.setInt8(position, value, true);
+		updatedPosition = position + 1;
+		return next;
+	}
+	if ((next = transition.string16 || transition.object16)) {
+		targetView.setInt16(position, value, true);
+		updatedPosition = position + 2;
+		return next;
+	}
+	if ((next = transition.num32)) {
+		targetView.setUint32(position, 0xe0000100 + value, true);
+		updatedPosition = position + 4;
+		return next;
+	}
+	if ((next = transition.num64)) {
+		targetView.setFloat64(position, NaN, true);
+		targetView.setInt8(position, value);
+		updatedPosition = position + 8;
+		return next;
+	}
+	updatedPosition = position;
+	return null;
+}
+
+/**
+ * Encode `object` as a random-access struct (standalone path — used when the
+ * base encoder doesn't expose the writeStructSlots hook, e.g. cbor-x).
  *
  * @param {object} object
  * @param {function} encodeNested  - (value) => Uint8Array, for nested objects
@@ -142,29 +604,32 @@ function anyTypeFixed(transition, value /* -10=null, -9=undefined */) {
  * @returns {Uint8Array|null}
  */
 export function writeStruct(object, encodeNested, packr) {
+	// Grab work buffers for this nesting depth before incrementing so that
+	// any encodeNested call (which may re-enter writeStruct) uses the next slot.
+	const work = _getWork();
+	_depth++;
+	try {
+		return _encode(object, encodeNested, packr, work);
+	} finally {
+		_depth--;
+	}
+}
+
+function _encode(object, encodeNested, packr, work) {
 	let typedStructs = packr.typedStructs || (packr.typedStructs = []);
 	let transition = typedStructs.transitions || (typedStructs.transitions = Object.create(null));
 
 	const nextId = typedStructs.length;
 	const headerSize =
-		nextId < 0x10  ? 1 :
-		nextId < 0xf0  ? 2 :
-		nextId < 0xf000 ? 3 :
+		nextId < 0x10    ? 1 :
+		nextId < 0xf0    ? 2 :
+		nextId < 0xf000  ? 3 :
 		nextId < 0xf00000 ? 4 : 0;
 	if (headerSize === 0) return null;
 
-	// primFixed: fixed bytes for non-queued fields (in enumeration order)
-	// objFixed:  fixed bytes for queued fields (objects / null / undefined)
-	// strRef:    string bytes written to ref section
-	// objRef:    msgpack/cbor-encoded object bytes written to ref section
-	const primFixed = [];
-	const objFixed = [];
-	const strRef = [];
-	const objRef = [];
-	let strRefOffset = 0; // running byte count in strRef
-	let objRefOffset = 0; // running byte count in objRef
-
-	const queuedReferences = []; // [key, value, keyIndex, ...]
+	let fixedPos = 0;
+	let refsPos  = 0;
+	const queuedReferences = [];
 	let usedAscii0 = false;
 	let keyIndex = 0;
 	let structureUpdated = false;
@@ -175,6 +640,7 @@ export function writeStruct(object, encodeNested, packr) {
 		if (!nextTransition) {
 			transition[key] = nextTransition = createBlankTransition(key, transition);
 		}
+		if (fixedPos + 8 > work.fixedBuf.length) _growFixed(work, fixedPos + 8);
 
 		switch (typeof value) {
 			case 'number': {
@@ -187,38 +653,38 @@ export function writeStruct(object, encodeNested, packr) {
 							 number < 0x20 && !nextTransition.num32)
 						) {
 							transition = nextTransition.num8 || createTypeTransition(nextTransition, NUMBER, 1);
-							primFixed.push(new Uint8Array([number]));
+							work.fixedBuf[fixedPos++] = number;
 						} else {
 							transition = nextTransition.num32 || createTypeTransition(nextTransition, NUMBER, 4);
-							const b = new Uint8Array(4);
-							new DataView(b.buffer).setUint32(0, number, true);
-							primFixed.push(b);
+							work.fixedView.setUint32(fixedPos, number, true);
+							fixedPos += 4;
 						}
 						break;
 					} else if (number < 0x100000000 && number >= -0x80000000) {
-						const f32b = new Uint8Array(4);
-						new DataView(f32b.buffer).setFloat32(0, number, true);
-						if (float32Headers[f32b[3] >>> 5]) {
+						work.fixedView.setFloat32(fixedPos, number, true);
+						if (float32Headers[work.fixedBuf[fixedPos + 3] >>> 5]) {
 							let xShifted;
-							if (((xShifted = number * mult10[((f32b[3] & 0x7f) << 1) | (f32b[2] >> 7)]) >> 0) === xShifted) {
+							if (((xShifted = number * mult10[((work.fixedBuf[fixedPos + 3] & 0x7f) << 1) | (work.fixedBuf[fixedPos + 2] >> 7)]) >> 0) === xShifted) {
 								transition = nextTransition.num32 || createTypeTransition(nextTransition, NUMBER, 4);
-								primFixed.push(f32b);
+								fixedPos += 4;
 								break;
 							}
 						}
 					}
 				}
 				transition = nextTransition.num64 || createTypeTransition(nextTransition, NUMBER, 8);
-				const b64 = new Uint8Array(8);
-				new DataView(b64.buffer).setFloat64(0, number, true);
-				primFixed.push(b64);
+				work.fixedView.setFloat64(fixedPos, number, true);
+				fixedPos += 8;
 				break;
 			}
 
 			case 'string': {
-				const strBytes = utf8Encode(value);
-				const isNotAscii = strBytes.length > value.length;
-				const curOffset = strRefOffset;
+				const strStart = refsPos;
+				refsPos = _writeStr(work, refsPos, value);
+				const isNotAscii = refsPos - strStart > value.length;
+				const curOffset = strStart;
+
+				if (fixedPos + 2 > work.fixedBuf.length) _growFixed(work, fixedPos + 2);
 
 				if (curOffset < 0xa0 || (curOffset < 0xf6 && (nextTransition.ascii8 || nextTransition.string8))) {
 					if (isNotAscii) {
@@ -232,43 +698,38 @@ export function writeStruct(object, encodeNested, packr) {
 								transition = createTypeTransition(nextTransition, UTF8, 1);
 							}
 						}
-						primFixed.push(new Uint8Array([curOffset]));
+						work.fixedBuf[fixedPos++] = curOffset;
 					} else if (curOffset === 0 && !usedAscii0) {
 						usedAscii0 = true;
 						transition = nextTransition.ascii0 || createTypeTransition(nextTransition, ASCII, 0);
-						// size=0: no fixed bytes pushed
+						// size=0: no fixed byte written
 					} else {
 						if (!(transition = nextTransition.ascii8) &&
 							!(typedStructs.length > 10 && (transition = nextTransition.string8)))
 							transition = createTypeTransition(nextTransition, ASCII, 1);
-						primFixed.push(new Uint8Array([curOffset]));
+						work.fixedBuf[fixedPos++] = curOffset;
 					}
 				} else {
 					transition = nextTransition.string16 || createTypeTransition(nextTransition, UTF8, 2);
-					const b = new Uint8Array(2);
-					new DataView(b.buffer).setUint16(0, curOffset, true);
-					primFixed.push(b);
+					work.fixedView.setUint16(fixedPos, curOffset, true);
+					fixedPos += 2;
 				}
-				strRef.push(strBytes);
-				strRefOffset += strBytes.length;
 				break;
 			}
 
 			case 'object': {
 				if (value && value.constructor === Date) {
 					transition = nextTransition.date64 || createTypeTransition(nextTransition, DATE, 8);
-					const bd = new Uint8Array(8);
-					new DataView(bd.buffer).setFloat64(0, value.getTime(), true);
-					primFixed.push(bd);
+					work.fixedView.setFloat64(fixedPos, value.getTime(), true);
+					fixedPos += 8;
 				} else if (value) {
 					queuedReferences.push(key, value, keyIndex);
-					// no primFixed push — queued bytes go to objFixed
 				} else {
 					// null
-					const any = anyTypeFixed(nextTransition, -10);
-					if (any) {
-						transition = any.transition;
-						primFixed.push(any.bytes);
+					const any = _anyTypeFixed(work, nextTransition, fixedPos, -10);
+					if (any !== null) {
+						transition = any;
+						fixedPos = _anyPos;
 					} else {
 						queuedReferences.push(key, null, keyIndex);
 					}
@@ -279,14 +740,14 @@ export function writeStruct(object, encodeNested, packr) {
 			case 'boolean':
 				transition = nextTransition.num8 || nextTransition.ascii8 ||
 					createTypeTransition(nextTransition, NUMBER, 1);
-				primFixed.push(new Uint8Array([value ? 0xf9 : 0xf8]));
+				work.fixedBuf[fixedPos++] = value ? 0xf9 : 0xf8;
 				break;
 
 			case 'undefined': {
-				const any = anyTypeFixed(nextTransition, -9);
-				if (any) {
-					transition = any.transition;
-					primFixed.push(any.bytes);
+				const any = _anyTypeFixed(work, nextTransition, fixedPos, -9);
+				if (any !== null) {
+					transition = any;
+					fixedPos = _anyPos;
 				} else {
 					queuedReferences.push(key, undefined, keyIndex);
 				}
@@ -300,12 +761,11 @@ export function writeStruct(object, encodeNested, packr) {
 		keyIndex++;
 	}
 
-	// Queued objects/null/undefined — their fixed bytes follow the primitive fixed bytes
-	const totalStrBytes = strRefOffset;
-
+	// Queued objects/null/undefined — their fixed bytes (offsets into ref section)
+	// follow the primitive fixed bytes.
 	for (let i = 0, l = queuedReferences.length; i < l;) {
-		const key = queuedReferences[i++];
-		const value = queuedReferences[i++];
+		const key       = queuedReferences[i++];
+		const value     = queuedReferences[i++];
 		const propertyIndex = queuedReferences[i++];
 
 		let nextTransition = transition[key];
@@ -320,10 +780,15 @@ export function writeStruct(object, encodeNested, packr) {
 			};
 		}
 
+		if (fixedPos + 4 > work.fixedBuf.length) _growFixed(work, fixedPos + 4);
+
 		if (value != null) {
-			// Encode value (object or queued string) as msgpack/cbor in the ref section
 			const encoded = encodeNested(value);
-			const curOffset = totalStrBytes + objRefOffset;
+			const curOffset = refsPos;
+			if (refsPos + encoded.length > work.refsBuf.length) _growRefs(work, encoded.length);
+			work.refsBuf.set(encoded, refsPos);
+			refsPos += encoded.length;
+
 			let size;
 			if (curOffset < 0xff00) {
 				transition = nextTransition.object16;
@@ -334,23 +799,18 @@ export function writeStruct(object, encodeNested, packr) {
 				transition = nextTransition.object32 || createTypeTransition(nextTransition, OBJECT_DATA, 4);
 				size = 4;
 			}
-			const b = new Uint8Array(size);
-			if (size === 2) new DataView(b.buffer).setUint16(0, curOffset, true);
-			else new DataView(b.buffer).setUint32(0, curOffset, true);
-			objFixed.push(b);
-			objRef.push(encoded);
-			objRefOffset += encoded.length;
+			if (size === 2) { work.fixedView.setUint16(fixedPos, curOffset, true); fixedPos += 2; }
+			else            { work.fixedView.setUint32(fixedPos, curOffset, true); fixedPos += 4; }
 		} else {
 			// null or undefined sentinel
 			transition = nextTransition.object16 || createTypeTransition(nextTransition, OBJECT_DATA, 2);
-			const b = new Uint8Array(2);
-			new DataView(b.buffer).setInt16(0, value === null ? -10 : -9, true);
-			objFixed.push(b);
+			work.fixedView.setInt16(fixedPos, value === null ? -10 : -9, true);
+			fixedPos += 2;
 		}
 		keyIndex++;
 	}
 
-	// Build/retrieve structure definition from the transition chain
+	// Build/retrieve structure definition from the transition chain.
 	let recordId = transition[RECORD_SYMBOL];
 	if (recordId == null) {
 		recordId = typedStructs.length;
@@ -359,11 +819,11 @@ export function writeStruct(object, encodeNested, packr) {
 		while (t.__type !== undefined) {
 			const type = t.__type;
 			const size = t.__size;
-			const keyTrans = t.__parent; // key-level transition
+			const keyTrans = t.__parent;
 			const entry = [type, size, keyTrans.key];
 			if (keyTrans.enumerationOffset) entry.push(keyTrans.enumerationOffset);
 			structure.push(entry);
-			t = keyTrans.parent; // move to parent type-level transition
+			t = keyTrans.parent;
 		}
 		structure.reverse();
 		transition[RECORD_SYMBOL] = recordId;
@@ -373,51 +833,13 @@ export function writeStruct(object, encodeNested, packr) {
 
 	if (structureUpdated && packr._onStructureAdded) packr._onStructureAdded();
 
-	// Build header
-	const header = buildHeader(recordId, headerSize);
-	if (!header) return null;
-
-	// Combine into final buffer
-	let totalSize = header.length;
-	for (const b of primFixed) totalSize += b.length;
-	for (const b of objFixed) totalSize += b.length;
-	for (const b of strRef) totalSize += b.length;
-	for (const b of objRef) totalSize += b.length;
-
+	// Assemble: [header][fixedSection][refsSection] — one allocation total.
+	const totalSize = headerSize + fixedPos + refsPos;
 	const result = new Uint8Array(totalSize);
-	let pos = 0;
-	result.set(header, pos); pos += header.length;
-	for (const b of primFixed) { result.set(b, pos); pos += b.length; }
-	for (const b of objFixed) { result.set(b, pos); pos += b.length; }
-	for (const b of strRef) { result.set(b, pos); pos += b.length; }
-	for (const b of objRef) { result.set(b, pos); pos += b.length; }
-
+	_writeHeader(result, recordId, headerSize);
+	result.set(work.fixedBuf.subarray(0, fixedPos), headerSize);
+	if (refsPos > 0) result.set(work.refsBuf.subarray(0, refsPos), headerSize + fixedPos);
 	return result;
-}
-
-function buildHeader(recordId, headerSize) {
-	switch (headerSize) {
-		case 1:
-			if (recordId >= 0x10) return null;
-			return new Uint8Array([recordId + 0x20]);
-		case 2:
-			if (recordId >= 0x100) return null;
-			return new Uint8Array([0x38, recordId]);
-		case 3: {
-			if (recordId >= 0x10000) return null;
-			const b = new Uint8Array(3);
-			b[0] = 0x39;
-			new DataView(b.buffer).setUint16(1, recordId, true);
-			return b;
-		}
-		case 4: {
-			if (recordId >= 0x1000000) return null;
-			const b = new Uint8Array(4);
-			new DataView(b.buffer).setUint32(0, (recordId << 8) + 0x3a, true);
-			return b;
-		}
-	}
-	return null;
 }
 
 /**
@@ -540,6 +962,19 @@ export function readStruct(src, position, srcEnd, unpackr) {
 						if (end == null) end = source.bytesEnd - refStart;
 						if (t === UTF8) {
 							return readString(source.bytes, ref + refStart, end - ref);
+						}
+						// Prefer msgpackr's unpack(src, {start, end}) when available — it dispatches
+						// struct bytes through the registered readStruct hook, supporting nested
+						// structs inside arrays/records.  Falls back to _decodeSliceDirect for
+						// base classes (cbor-x) that don't accept start/end options on unpack.
+						if (typeof unpackr.unpack === 'function' && unpackr.constructor &&
+							typeof unpackr.constructor.setReadStruct === 'function') {
+							currentSource = source;
+							try {
+								return unpackr.unpack(source.bytes, { start: ref + refStart, end: end + refStart });
+							} finally {
+								currentSource = null;
+							}
 						}
 						return unpackr._decodeSliceDirect(source.bytes, ref + refStart, end + refStart);
 					}; })(property, type);

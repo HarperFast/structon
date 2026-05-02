@@ -1,51 +1,64 @@
 import {
-	writeStruct, readStruct,
-	onLoadedStructures, prepareStructures,
+	writeStruct, writeStructInPlace,
+	readStruct, onLoadedStructures, prepareStructures, saveState,
 	SOURCE_SYMBOL,
 } from './struct.js';
+
+// Track which BaseClasses have had hooks registered so we don't re-register.
+const _hooksRegistered = new WeakSet();
 
 /**
  * Creates a class that extends `BaseClass` (msgpackr's Packr or cbor-x's Encoder)
  * and adds random-access struct encoding/decoding.
  *
- * The struct binary format is identical to msgpackr's struct.js so data is
- * interoperable between both implementations.
+ * Two encoding paths are supported:
  *
- * For top-level plain objects the encoder writes a compact fixed-width struct
- * header plus a variable-length ref section.  All inner nested-object data is
- * serialized by the base class, so the correct inner format (msgpack or cbor)
- * is used automatically depending on which class you extend.
+ *  - **Fast path** (msgpackr ≥ 2.0.1 with `setWriteStructSlots` / `setReadStruct`):
+ *    structon registers its writeStruct as a hook in msgpackr's encoder so that
+ *    plain objects are written directly into msgpackr's shared target buffer.
+ *    No intermediate allocations.  Detected automatically by checking for
+ *    `BaseClass.setWriteStructSlots`.
+ *
+ *  - **Standalone path** (cbor-x, msgpackr without hooks):
+ *    structon wraps `encode`/`decode` and uses its own pre-allocated work
+ *    buffers, returning a fresh Uint8Array per encode call.
+ *
+ * Either way, the binary format is identical to msgpackr's struct.js.
  *
  * @param {class} BaseClass  - msgpackr Packr / Encoder or cbor-x Encoder
  * @returns {class} Structon subclass
- *
- * @example
- * import { Packr } from 'msgpackr';
- * import { createStructon } from 'structon';
- * const Structon = createStructon(Packr);
- * const s = new Structon({ structures: [] });
- * const encoded = s.encode({ name: 'Alice', age: 30 });
- * const decoded = s.decode(encoded);
- * console.log(decoded.name); // 'Alice'  — random access, zero-copy lazy
  */
 export function createStructon(BaseClass) {
-	// Capture base-class decode/unpack at class-creation time so we can call
-	// them without risking infinite recursion through our overrides.
 	const _baseDecode = BaseClass.prototype.decode;
 	const _baseUnpack = BaseClass.prototype.unpack || null;
 
+	// Detect the msgpackr fast path: msgpackr ≥ 2.0.1 exposes setWriteStructSlots
+	// as a static on Packr (and setReadStruct on Unpackr).
+	const setWriteStructSlots = BaseClass.setWriteStructSlots;
+	const setReadStruct = findStaticOnChain(BaseClass, 'setReadStruct');
+	const fastPath = typeof setWriteStructSlots === 'function' && typeof setReadStruct === 'function';
+
+	if (fastPath && !_hooksRegistered.has(BaseClass)) {
+		setWriteStructSlots(writeStructInPlace, prepareStructures);
+		setReadStruct(readStruct, onLoadedStructures, saveState);
+		_hooksRegistered.add(BaseClass);
+	}
+
 	class Structon extends BaseClass {
 		constructor(options = {}) {
-			// Disable msgpackr's own randomAccessStructure hook so it doesn't
-			// interfere with our struct handling.
-			super({ ...options, randomAccessStructure: false });
+			super(options);
 
 			// Initialise typed structures state on this instance
 			if (!this.typedStructs) this.typedStructs = [];
 
-			// Both msgpackr's Packr and cbor-x's Encoder set encode as an OWN
-			// property (closure) inside their constructor, so we must wrap it here
-			// rather than on the prototype.
+			if (fastPath) {
+				// Opt this instance into struct encoding/decoding via the hooks.
+				this._useStructEncoding = true;
+				// No encode/decode wrappers needed — msgpackr's pipeline handles it.
+				return;
+			}
+
+			// Standalone path: wrap encode (set as own property by the base ctor).
 			if (Object.prototype.hasOwnProperty.call(this, 'encode')) {
 				const _super = this.encode.bind(this);
 				const self = this;
@@ -75,27 +88,26 @@ export function createStructon(BaseClass) {
 			return superEncode(value, encodeOptions);
 		}
 
-		// Override decode on the prototype (works for both msgpackr and cbor-x
-		// since neither sets decode as an own property from their constructor).
 		decode(source) {
+			// Fast path: let msgpackr's checkedRead dispatch via the readStruct hook.
+			if (this._useStructEncoding) return _baseDecode.call(this, source);
+
+			// Standalone path: intercept top-level struct bytes ourselves.
 			const src = toUint8Array(source);
 			if (src.length > 0 && src[0] >= 0x20 && src[0] < 0x40) {
-				// Parse record ID from header to confirm this is a known struct,
-				// not a msgpack fixint that happens to be in 0x20-0x3f range.
 				const recordId = peekRecordId(src);
 				this._ensureTypedStructures();
 				if (recordId !== -1 && this.typedStructs && this.typedStructs[recordId]) {
 					return readStruct(src, 0, src.length, this);
 				}
 			}
-			// Delegate to the true base-class implementation (not our override)
 			return _baseDecode.call(this, source);
 		}
 
 		/**
-		 * Decode bytes from src[start..end) — called from readStruct getters for
-		 * OBJECT_DATA fields.  Checks for nested struct bytes, then falls through
-		 * to the base decoder.
+		 * Decode bytes from src[start..end) — used by readStruct's OBJECT_DATA
+		 * getters when the base class doesn't support unpack(src, {start, end})
+		 * (e.g. cbor-x).
 		 */
 		_decodeSliceDirect(src, start, end) {
 			if (end > start && src[start] >= 0x20 && src[start] < 0x40) {
@@ -110,7 +122,6 @@ export function createStructon(BaseClass) {
 			return _baseDecode.call(this, slice2);
 		}
 
-		/** Load shared typed structures if not yet initialised. */
 		_ensureTypedStructures() {
 			if (this.typedStructs && this.typedStructs.transitions) return;
 			this._loadStructures();
@@ -118,24 +129,16 @@ export function createStructon(BaseClass) {
 
 		_loadStructures() {
 			let sharedData;
-			// msgpackr API
 			if (typeof this.getStructures === 'function') sharedData = this.getStructures();
-			// cbor-x API
 			else if (typeof this.getShared === 'function') sharedData = this.getShared();
 			if (sharedData) onLoadedStructures.call(this, sharedData);
 		}
 
 		_saveTypedStructures() {
-			// msgpackr API: saveStructures receives a Map(named, typed) or array
 			if (typeof this.saveStructures === 'function') {
-				const structures = prepareStructures(
-					this.structures || [],
-					this
-				);
+				const structures = prepareStructures(this.structures || [], this);
 				this.saveStructures(structures);
-			}
-			// cbor-x API: saveShared receives a plain object
-			else if (typeof this.saveShared === 'function') {
+			} else if (typeof this.saveShared === 'function') {
 				this.saveShared({
 					structures: this.structures || [],
 					typedStructs: this.typedStructs,
@@ -143,9 +146,11 @@ export function createStructon(BaseClass) {
 			}
 		}
 
-		// Compatibility shim used by msgpackr's internal _mergeStructures path
+		// Compatibility shim used by msgpackr's internal _mergeStructures path on
+		// the standalone (non-fast) path.  On the fast path msgpackr now installs
+		// onLoadedStructures via setReadStruct and calls it directly.
 		_mergeStructures(loadedStructures) {
-			if (loadedStructures) onLoadedStructures.call(this, loadedStructures);
+			if (!fastPath && loadedStructures) onLoadedStructures.call(this, loadedStructures);
 			if (super._mergeStructures) return super._mergeStructures(loadedStructures);
 		}
 
@@ -158,6 +163,15 @@ export function createStructon(BaseClass) {
 	return Structon;
 }
 
+function findStaticOnChain(cls, name) {
+	let c = cls;
+	while (c) {
+		if (typeof c[name] === 'function') return c[name];
+		c = Object.getPrototypeOf(c);
+	}
+	return null;
+}
+
 function toUint8Array(source) {
 	if (source instanceof Uint8Array) return source;
 	if (typeof Buffer !== 'undefined' && Buffer.isBuffer(source)) return source;
@@ -165,12 +179,10 @@ function toUint8Array(source) {
 	return new Uint8Array(source);
 }
 
-// Parse the struct record ID from the first byte(s) of src without fully
-// decoding it.  Returns -1 if the buffer is too short for the header.
 function peekRecordId(src) {
 	if (src.length < 1) return -1;
 	let id = src[0] - 0x20;
-	if (id < 24) return id; // 1-byte header, record IDs 0-15 (0x20-0x2f) + 16-23 via 0x30-0x37
+	if (id < 24) return id;
 	switch (id) {
 		case 24: return src.length > 1 ? src[1] : -1;
 		case 25: return src.length > 2 ? src[1] + (src[2] << 8) : -1;
