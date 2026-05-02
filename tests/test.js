@@ -1,9 +1,10 @@
 import { suite, test } from 'mocha';
 import assert from 'assert';
-import { Packr } from 'msgpackr';
+import { Packr } from 'msgpackr'; // v2 — no randomAccessStructure
+import { Packr as LegacyPackr } from 'msgpackr-legacy'; // v1.11 — has randomAccessStructure
 import { createStructon } from '../index.js';
 
-const Structon = createStructon(Packr);
+const Structon = createStructon(Packr); // structon wrapping msgpackr v2
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -230,19 +231,51 @@ suite('structon – structure persistence', function () {
 // import registers the read/write hooks on Packr's setWriteStructSlots /
 // setReadStruct globals.
 
-// Side-effect import: registers msgpackr's struct.js hooks once.
-await import('../node_modules/msgpackr/struct.js');
+// ── structon with msgpackr v2 ─────────────────────────────────────────────────
 
-suite('structon – msgpackr randomAccessStructure round-trip', function () {
-	test('Structon → msgpackr: bytes produced by Structon are decoded by Packr', async function () {
-		const { Packr } = await import('msgpackr');
+suite('structon – with msgpackr v2', function () {
+	// The top-level Structon already wraps v2 Packr, but this suite makes it explicit.
+	test('basic roundtrip using msgpackr v2 as the base encoder', function () {
+		const enc = new Structon({ structures: [] });
+		const result = roundtrip(enc, { name: 'v2 user', age: 42, active: true });
+		assert.strictEqual(result.name, 'v2 user');
+		assert.strictEqual(result.age, 42);
+		assert.strictEqual(result.active, true);
+	});
 
+	test('struct bytes are still produced (not plain msgpack records)', function () {
+		const enc = new Structon({ structures: [] });
+		const buf = enc.encode({ x: 1, y: 2 });
+		assert.ok(buf[0] >= 0x20 && buf[0] < 0x40, 'expected struct header byte');
+	});
+
+	test('msgpackr v2 Packr alone does not produce struct bytes', function () {
+		const plain = new Packr({ structures: [] });
+		const buf = plain.pack({ x: 1, y: 2 });
+		// v2 encodes as a msgpack record (0x40+) or map, not a struct
+		assert.ok(buf[0] < 0x20 || buf[0] >= 0x40, 'v2 alone should not produce struct header bytes');
+	});
+});
+
+// ── binary compatibility with msgpackr v1.11 randomAccessStructure ────────────
+//
+// These tests verify that bytes flow correctly in both directions between
+// structon and msgpackr v1.11's native randomAccessStructure implementation:
+//   1. Structon writes  →  msgpackr v1.11 reads
+//   2. msgpackr v1.11 writes  →  Structon reads
+//
+// struct.js is imported via the direct node_modules path because msgpackr's
+// exports map does not expose it publicly; the side-effect import registers
+// the read/write hooks on the legacy Packr's globals.
+
+await import('../node_modules/msgpackr-legacy/struct.js');
+
+suite('structon – msgpackr v1.11 randomAccessStructure round-trip', function () {
+	test('Structon → msgpackr v1.11: bytes produced by Structon are decoded by legacy Packr', function () {
 		const sEnc = new Structon({ structures: [] });
 		const buf = sEnc.encode({ name: 'compat', value: 42 });
 
-		// Native Packr with randomAccessStructure reads the same buffer when
-		// given the same structure definitions.
-		const nativePackr = new Packr({
+		const nativePackr = new LegacyPackr({
 			structures: [],
 			randomAccessStructure: true,
 		});
@@ -253,10 +286,8 @@ suite('structon – msgpackr randomAccessStructure round-trip', function () {
 		assert.strictEqual(result.value, 42);
 	});
 
-	test('msgpackr → Structon: bytes produced by Packr (randomAccessStructure) are decoded by Structon', async function () {
-		const { Packr } = await import('msgpackr');
-
-		const nativePackr = new Packr({
+	test('msgpackr v1.11 → Structon: bytes produced by legacy Packr are decoded by Structon', function () {
+		const nativePackr = new LegacyPackr({
 			structures: [],
 			randomAccessStructure: true,
 		});
@@ -271,11 +302,9 @@ suite('structon – msgpackr randomAccessStructure round-trip', function () {
 		assert.strictEqual(result.amount, 1.5);
 	});
 
-	test('round-trip with mixed types and a nested object', async function () {
-		const { Packr } = await import('msgpackr');
-
+	test('round-trip with mixed types and a nested object', function () {
 		const sharedStructures = [];
-		const nativePackr = new Packr({
+		const nativePackr = new LegacyPackr({
 			structures: sharedStructures,
 			randomAccessStructure: true,
 		});
@@ -288,13 +317,10 @@ suite('structon – msgpackr randomAccessStructure round-trip', function () {
 			meta: { kind: 'sample', priority: 5 },
 		};
 
-		// msgpackr writes — populates nativePackr.typedStructs (random-access struct
-		// definitions) and nativePackr.structures (msgpack record definitions
-		// used for the nested object).
 		const buf = nativePackr.encode(value);
 
-		// Structon reads.  We pass the same `structures` array so msgpackr's
-		// inner unpack can resolve the record id used for the nested object.
+		// Pass the same structures array so the inner msgpack record id used for
+		// the nested object can be resolved.
 		const sEnc = new Structon({ structures: nativePackr.structures });
 		sEnc.typedStructs = nativePackr.typedStructs;
 
@@ -308,15 +334,13 @@ suite('structon – msgpackr randomAccessStructure round-trip', function () {
 		assert.strictEqual(result.meta.priority, 5);
 	});
 
-	test('Structon and msgpackr produce byte-identical output for the same input', async function () {
-		const { Packr } = await import('msgpackr');
-
+	test('Structon and msgpackr v1.11 produce byte-identical output for the same input', function () {
 		const value = { x: 5, label: 'hello', flag: true };
 
 		const sEnc = new Structon({ structures: [] });
 		const sBuf = sEnc.encode(value);
 
-		const nativePackr = new Packr({
+		const nativePackr = new LegacyPackr({
 			structures: [],
 			randomAccessStructure: true,
 		});
@@ -325,7 +349,7 @@ suite('structon – msgpackr randomAccessStructure round-trip', function () {
 		assert.deepStrictEqual(
 			Array.from(sBuf),
 			Array.from(nBuf),
-			'Structon and msgpackr should emit identical byte sequences for the same plain object'
+			'Structon and msgpackr v1.11 should emit identical byte sequences'
 		);
 	});
 });

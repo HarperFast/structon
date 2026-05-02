@@ -15,6 +15,7 @@
   "types": "./index.d.ts",
   "scripts": {
     "test": "mocha tests/test*.js -u tdd --experimental-json-modules",
+    "benchmark": "node tests/benchmark.js",
     "build": "rollup -c"
   },
   "keywords": [
@@ -42,7 +43,8 @@
   "devDependencies": {
     "cbor-x": "^1.6.4",
     "mocha": "^10.0.0",
-    "msgpackr": "1.11.10",
+    "msgpackr": "^2.0.0",
+    "msgpackr-legacy": "npm:msgpackr@1.11.10",
     "rollup": "^4.60.2"
   }
 }
