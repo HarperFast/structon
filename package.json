@@ -1,6 +1,6 @@
 {
   "name": "structon",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Random-access struct encoding/decoding as an extensible class for msgpackr, cbor-x, and compatible encoders",
   "license": "Apache-2.0",
   "type": "module",
