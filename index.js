@@ -82,20 +82,22 @@ export function createStructon(BaseClass) {
 			return superEncode(value, encodeOptions);
 		}
 
-		decode(source) {
+		decode(source, options) {
 			// Fast path: let the BaseClass's checkedRead dispatch via _readStruct.
-			if (fastPath) return _baseDecode.call(this, source);
+			if (fastPath) return _baseDecode.call(this, source, options);
 
 			// Standalone path: intercept top-level struct bytes ourselves.
 			const src = toUint8Array(source);
-			if (src.length > 0 && src[0] >= 0x20 && src[0] < 0x40) {
+			const start = options?.start || 0;
+			const srcEnd = options?.end ?? src.length;
+			if (srcEnd > start && src[start] >= 0x20 && src[start] < 0x40) {
 				const recordId = peekRecordId(src);
 				this._ensureTypedStructures();
 				if (recordId !== -1 && this.typedStructs && this.typedStructs[recordId]) {
-					return readStruct.call(this, src, 0, src.length);
+					return readStruct.call(this, src, start, srcEnd);
 				}
 			}
-			return _baseDecode.call(this, source);
+			return _baseDecode.call(this, source, options);
 		}
 
 		/**
