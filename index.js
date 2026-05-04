@@ -87,11 +87,14 @@ export function createStructon(BaseClass) {
 			if (fastPath) return _baseDecode.call(this, source, options);
 
 			// Standalone path: intercept top-level struct bytes ourselves.
-			const src = toUint8Array(source);
+			let src = toUint8Array(source);
 			const start = options?.start || 0;
 			const srcEnd = options?.end ?? src.length;
 			if (srcEnd > start && src[start] >= 0x20 && src[start] < 0x40) {
 				const recordId = peekRecordId(src);
+				// _ensureTypedStructures may call getStructures which reads from the DB into
+				// the same reusable buffer — copy src before that can overwrite it
+				src = Uint8Array.prototype.slice.call(src, 0, srcEnd);
 				this._ensureTypedStructures();
 				if (recordId !== -1 && this.typedStructs && this.typedStructs[recordId]) {
 					return readStruct.call(this, src, start, srcEnd);
