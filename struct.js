@@ -870,6 +870,8 @@ export function readStruct(src, position, srcEnd) {
 	let structure = unpackr.typedStructs && unpackr.typedStructs[recordId];
 	if (!structure) {
 		if (typeof unpackr._loadStructures === 'function') {
+			// getStructures reads from the DB into the same reusable buffer — copy src first
+			src = Uint8Array.prototype.slice.call(src, 0, srcEnd);
 			unpackr._loadStructures();
 			structure = unpackr.typedStructs && unpackr.typedStructs[recordId];
 		}
