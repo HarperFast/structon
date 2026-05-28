@@ -383,3 +383,59 @@ suite('structon – repeated encodings', function () {
 		assert.strictEqual(rb.z, 3);
 	});
 });
+
+// ── round-trip when the shared data is persisted via the encoder itself ───────
+//
+// Regression: when a host (like a database) routes saved structures through the
+// same encoder, the Map produced by prepareStructures gets serialized and round-
+// tripped through msgpackr.  Earlier versions of onLoadedStructures checked
+// `instanceof Map` and silently dropped non-Map payloads, and never returned a
+// value — so msgpackr's _mergeStructures saw `undefined`, defaulted to [], and
+// overwrote this.structures.  Records that referenced msgpackr's named record
+// IDs then failed to decode.
+
+suite('structon – shared data round-tripped through the encoder', function () {
+	test('nested record-format objects survive a fresh reader when shared data is encoded', function () {
+		let savedBuffer = null;
+		const writer = new Structon({
+			structures: [],
+			saveStructures(structures) { savedBuffer = writer.encode(structures); },
+			getStructures() { return savedBuffer ? writer.decode(savedBuffer) : undefined; },
+		});
+
+		// `permission: { super_user: true }` is encoded as a msgpackr record:
+		// 1 marker byte (0x40+) + 1 byte for `true`.  A fresh reader needs the
+		// named structures to interpret the marker.
+		const buf = writer.encode({ id: 'super_user', permission: { super_user: true } });
+
+		const reader = new Structon({
+			structures: [],
+			getStructures() { return savedBuffer ? reader.decode(savedBuffer) : undefined; },
+		});
+		const result = reader.decode(buf);
+		assert.deepStrictEqual(materialize(result).permission, { super_user: true });
+	});
+
+	test('onLoadedStructures handles a plain-object shared-data payload', function () {
+		// Simulate what msgpackr produces when `mapsAsObjects: true` turns a
+		// saved Map into a plain object on the way back.
+		let savedAsObject = null;
+		const writer = new Structon({
+			structures: [],
+			saveStructures(structures) {
+				if (structures instanceof Map) {
+					savedAsObject = { named: structures.get('named'), typed: structures.get('typed') };
+				}
+			},
+			getStructures() { return savedAsObject; },
+		});
+		const buf = writer.encode({ id: 'super_user', permission: { super_user: true } });
+
+		const reader = new Structon({
+			structures: [],
+			getStructures() { return savedAsObject; },
+		});
+		const result = reader.decode(buf);
+		assert.deepStrictEqual(materialize(result).permission, { super_user: true });
+	});
+});

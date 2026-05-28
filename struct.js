@@ -1078,9 +1078,23 @@ export function readStruct(src, position, srcEnd) {
  * Accepts the same Map format that msgpackr's struct.js produces.
  */
 export function onLoadedStructures(sharedData) {
-	if (!(sharedData instanceof Map)) return;
-	let named = sharedData.get('named') || [];
-	let typed = sharedData.get('typed') || [];
+	if (!sharedData) return this.structures;
+	let named, typed;
+	if (sharedData instanceof Map) {
+		named = sharedData.get('named') || [];
+		typed = sharedData.get('typed') || [];
+	} else if (Array.isArray(sharedData)) {
+		// Legacy form: just the named structures array.
+		named = sharedData;
+		typed = this.typedStructs || [];
+	} else if (typeof sharedData === 'object') {
+		// Plain object form (e.g. a Map round-tripped through msgpackr with
+		// mapsAsObjects: true, which is the default).
+		named = sharedData.named || [];
+		typed = sharedData.typed || [];
+	} else {
+		return this.structures;
+	}
 	if (Object.isFrozen(typed)) typed = typed.map(s => s.slice(0));
 
 	// Reload named structures so msgpackr's length tracking stays in sync.
@@ -1114,6 +1128,11 @@ export function onLoadedStructures(sharedData) {
 	typed.transitions = transitions;
 	this.typedStructs = typed;
 	this.lastTypedStructuresLength = typed.length;
+	// Return the named structures so msgpackr's _mergeStructures uses our
+	// (unfrozen) array. Without this, _mergeStructures receives `undefined`,
+	// defaults to [], and overwrites this.structures, leaving msgpackr unable
+	// to look up records that were saved earlier.
+	return this.structures;
 }
 
 /**
@@ -1134,6 +1153,10 @@ export function prepareStructures(structures, packr) {
 			if ((existing.get('typed') || []).length !== lastTypedLen) ok = false;
 		} else if (Array.isArray(existing)) {
 			if (existing.length !== (packr.lastNamedStructuresLength || 0)) ok = false;
+		} else if (existing && typeof existing === 'object') {
+			// Plain object form (Map decoded with mapsAsObjects: true).
+			if ((existing.named || []).length !== (packr.lastNamedStructuresLength || 0)) ok = false;
+			if ((existing.typed || []).length !== lastTypedLen) ok = false;
 		}
 		if (!ok) onLoadedStructures.call(packr, existing);
 		return ok;
