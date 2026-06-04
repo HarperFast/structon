@@ -528,7 +528,10 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 
 	let recordId = transition[RECORD_SYMBOL];
 	if (recordId == null) {
-		if (_frozen) return 0;
+		// Re-check the cap here (not just the entry-time _frozen): nested encodes via
+		// pack() may have appended structures since entry, so this keeps typedStructs.length
+		// a hard bound rather than letting a record overshoot by its nesting depth.
+		if (packr.typedStructs.length >= (packr.maxOwnStructures ?? Infinity)) return 0;
 		recordId = packr.typedStructs.length;
 		const structure = [];
 		let nextTransition = transition;
@@ -836,7 +839,10 @@ function _encode(object, encodeNested, packr, work) {
 	// Build/retrieve structure definition from the transition chain.
 	let recordId = transition[RECORD_SYMBOL];
 	if (recordId == null) {
-		if (_frozen) return null;
+		// Re-check the cap here (not just the entry-time _frozen): nested encodes via
+		// encodeNested() may have appended structures since entry, so this keeps
+		// typedStructs.length a hard bound rather than overshooting by nesting depth.
+		if (typedStructs.length >= (packr.maxOwnStructures ?? Infinity)) return null;
 		recordId = typedStructs.length;
 		const structure = [];
 		let t = transition;
@@ -1101,6 +1107,11 @@ export function readStruct(src, position, srcEnd) {
  * Accepts the same Map format that msgpackr's struct.js produces.
  */
 export function onLoadedStructures(sharedData) {
+	// Replaying already-persisted structures must always fully rebuild the trie,
+	// regardless of maxOwnStructures — the cap only limits minting NEW structures
+	// during encode. _frozen is module-level and may be left true by a prior capped
+	// encode, so clear it here before the createTypeTransition rebuild below.
+	_frozen = false;
 	if (!sharedData) return this.structures;
 	let named, typed;
 	if (sharedData instanceof Map) {
