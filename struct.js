@@ -140,6 +140,22 @@ function createTypeTransition(transition, type, size) {
 	return t;
 }
 
+// Unfrozen variant: always mints. Used on the fast path once a queued nested value has
+// already been pack()ed — at that point pack() has advanced msgpackr's shared write
+// position, so bailing with `return 0` would corrupt the fallback. We must finish the
+// encode instead, even if that means minting a (bounded) handful of structures past the
+// cap. The cap is still enforced up front, before the first pack().
+function forceTypeTransition(transition, type, size) {
+	const typeName = TYPE_NAMES[type] + (size << 3);
+	let t = transition[typeName];
+	if (t) return t;
+	t = transition[typeName] = Object.create(null);
+	t.__type = type;
+	t.__size = size;
+	t.__parent = transition;
+	return t;
+}
+
 // ── Work-buffer pool (one pair per nesting depth) ─────────────────────────────
 //
 // Instead of allocating a new Uint8Array for each field value, we write
@@ -474,13 +490,18 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 		keyIndex++;
 	}
 
+	// Once we pack() a queued nested value, msgpackr's shared write position is advanced and
+	// a `return 0` would corrupt the plain-object fallback. So: while no ref has been packed
+	// yet, a frozen miss bails cleanly (return 0). After the first pack we can no longer bail,
+	// so we force-mint whatever the remaining fields need (bounded overshoot — see below).
+	let packedRef = false;
 	for (let i = 0, l = queuedReferences.length; i < l;) {
 		let key = queuedReferences[i++];
 		let value = queuedReferences[i++];
 		let propertyIndex = queuedReferences[i++];
 		let nextTransition = transition[key];
 		if (!nextTransition) {
-			if (_frozen) return 0;
+			if (_frozen && !packedRef) return 0;
 			transition[key] = nextTransition = {
 				key, parent: transition,
 				enumerationOffset: propertyIndex - keyIndex,
@@ -497,16 +518,20 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 				transition = nextTransition.object16;
 				if (transition) size = 2;
 				else if ((transition = nextTransition.object32)) size = 4;
-				else { transition = createTypeTransition(nextTransition, OBJECT_DATA, 2); size = 2; }
+				else {
+					if (_frozen && !packedRef) return 0; // clean bail before any pack()
+					transition = forceTypeTransition(nextTransition, OBJECT_DATA, 2); size = 2;
+				}
 			} else {
-				transition = nextTransition.object32 || createTypeTransition(nextTransition, OBJECT_DATA, 4);
+				transition = nextTransition.object32;
+				if (!transition) {
+					if (_frozen && !packedRef) return 0; // clean bail before any pack()
+					transition = forceTypeTransition(nextTransition, OBJECT_DATA, 4);
+				}
 				size = 4;
 			}
-			// Must bail BEFORE pack(): on the fast path pack() advances the shared encoder
-			// position, so a later `return 0` would make the plain-object fallback start at
-			// the wrong offset and emit garbage. Returning here leaves position untouched.
-			if (transition === undefined) return 0; // frozen: structure cap reached
 			newPosition = pack(value, refPosition);
+			packedRef = true;
 			if (typeof newPosition === 'object') {
 				// re-allocated buffer — refresh local refs
 				refPosition = newPosition.position;
@@ -522,20 +547,23 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 			if (size === 2) { targetView.setUint16(position, refOffset, true); position += 2; }
 			else            { targetView.setUint32(position, refOffset, true); position += 4; }
 		} else { // null or undefined
-			transition = nextTransition.object16 || createTypeTransition(nextTransition, OBJECT_DATA, 2);
+			transition = nextTransition.object16;
+			if (!transition) {
+				if (_frozen && !packedRef) return 0; // clean bail before any pack()
+				transition = forceTypeTransition(nextTransition, OBJECT_DATA, 2);
+			}
 			targetView.setInt16(position, value === null ? -10 : -9, true);
 			position += 2;
 		}
-		if (transition === undefined) return 0; // frozen: structure cap reached
 		keyIndex++;
 	}
 
 	let recordId = transition[RECORD_SYMBOL];
 	if (recordId == null) {
-		// Re-check the cap here (not just the entry-time _frozen): nested encodes via
-		// pack() may have appended structures since entry, so this keeps typedStructs.length
-		// a hard bound rather than letting a record overshoot by its nesting depth.
-		if (packr.typedStructs.length >= (packr.maxOwnStructures ?? Infinity)) return 0;
+		// Enforce the cap here only while nothing has been packed (flat records and the
+		// no-queued-refs case): bailing after a pack would corrupt the fallback, so a record
+		// that already packed nested refs completes and may mint a bounded few past the cap.
+		if (!packedRef && packr.typedStructs.length >= (packr.maxOwnStructures ?? Infinity)) return 0;
 		recordId = packr.typedStructs.length;
 		const structure = [];
 		let nextTransition = transition;

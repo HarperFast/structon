@@ -603,6 +603,18 @@ suite('structon – maxOwnStructures cap', function () {
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(enc.decode(enc.encode(r2)))), r2);
 	});
 
+	test('capped: a frozen miss AFTER an earlier ref was packed completes without corruption', function () {
+		// Fast-path hazard: the first nested ref packs (advancing the shared encoder position),
+		// then a later field misses its transition. Bailing there would corrupt the fallback, so
+		// the encode must complete instead. Round-trip verifies no garbage bytes are emitted.
+		const enc = new Structon({ structures: [], useRecords: false, maxOwnStructures: 2 });
+		const norm = (r) => JSON.parse(JSON.stringify(enc.decode(enc.encode(r))));
+		assert.deepStrictEqual(norm({ b: 1 }), { b: 1 });            // structure 0
+		assert.deepStrictEqual(norm({ a: { x: 1 } }), { a: { x: 1 } }); // structure 1, cap hit
+		const r = { a: { x: 1 }, b: { y: 2 } };                      // 'a' packs, then 'b' misses
+		assert.deepStrictEqual(norm(r), r);
+	});
+
 	test('new Structon(null) does not throw (null options = use defaults)', function () {
 		const enc = new Structon(null);
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(enc.decode(enc.encode({ a: 1 })))), { a: 1 });
