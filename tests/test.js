@@ -504,4 +504,19 @@ suite('structon – struct-write disabled stays records-mode / v1-decodable', fu
 		assert.strictEqual(materialize(result).name, 'legacy');
 		assert.strictEqual(materialize(result).value, 7);
 	});
+
+	test('_writeStruct = () => 0 keeps the struct-safe integer boundary (ints 0x20-0x3f written as uint8)', function () {
+		// A host that wants records-mode writes but retains struct READS should bail the write
+		// hook (return 0) rather than clear it. Clearing it would shift msgpackr's fixint boundary
+		// to 0x40, emitting bare fixints for top-level ints 0x20-0x3f — which the active struct
+		// read hook then misreads as struct headers. Bailing keeps them as uint8 (0xcc XX).
+		const enc = new Structon({ structures: [] });
+		enc._writeStruct = () => 0;
+		for (const v of [32, 35, 63]) {
+			const buf = Uint8Array.prototype.slice.call(enc.encode(v));
+			assert.strictEqual(buf[0], 0xcc, `value ${v} should use the uint8 marker (0xcc), not a bare fixint`);
+			assert.strictEqual(enc.decode(buf), v, `value ${v} should round-trip`);
+		}
+		assert.ok(enc.encode(31)[0] < 0x20, 'values below the struct range stay positive fixints');
+	});
 });
