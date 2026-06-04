@@ -287,4 +287,36 @@ suite('structon (cbor-x base) – maxOwnStructures cap', function () {
 	test('cap=256 bounds typedStructs and preserves round-trips', function () {
 		assert.ok(run(256) <= 256, 'typedStructs should not exceed the cap of 256');
 	});
+
+	test('nested records do not overshoot the cap', function () {
+		// A nested object mints its own structure before the outer record is minted, so a
+		// stale entry-time freeze flag could let the outer record push past the cap. The mint
+		// guard re-checks the live length, keeping typedStructs.length a hard bound.
+		const enc = new Structon({ structures: [], useRecords: false, maxOwnStructures: 4 });
+		let seed = 7;
+		const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+		for (let i = 0; i < 1000; i++) {
+			enc.encode({ outer: { inner: (rnd() * 1e7 | 0) * 1000 }, tag: 't' + (i % 20), n: (rnd() * 300 | 0) });
+		}
+		assert.ok(enc.typedStructs.length <= 4, 'nested encodes must not push typedStructs past the cap, got ' + enc.typedStructs.length);
+	});
+
+	test('persisted structures still load after a capped encoder froze the dictionary', function () {
+		// Regression: the freeze flag is module-level. A capped encoder that hits its cap must
+		// not block a later reader from rebuilding previously-persisted structures on load —
+		// the cap governs minting NEW structures during encode, not replaying saved ones.
+		let saved = null;
+		const writer = new Structon({ structures: [], saveStructures(s) { saved = s; return true; }, getStructures() { return saved; } });
+		const buf = writer.encode({ name: 'Alice', age: 30 });
+		assert.ok(buf[0] >= 0x20 && buf[0] < 0x40, 'writer should produce struct bytes');
+
+		const capped = new Structon({ structures: [], maxOwnStructures: 1 });
+		capped.encode({ x: 1 });
+		capped.encode({ y: 2, z: 3 }); // cap reached → freeze flag left set on the module
+
+		const reader = new Structon({ structures: [], getStructures() { return saved; } });
+		const result = reader.decode(buf); // triggers onLoadedStructures while frozen
+		assert.strictEqual(result.name, 'Alice');
+		assert.strictEqual(result.age, 30);
+	});
 });
