@@ -321,6 +321,18 @@ suite('structon (cbor-x base) – maxOwnStructures cap', function () {
 		assert.deepStrictEqual(norm(r), r);
 	});
 
+	test('a stream of nested-object shape variants stays bounded by the cap', function () {
+		const enc = new Structon({ structures: [], useRecords: false, maxOwnStructures: 4 });
+		const norm = (r) => JSON.parse(JSON.stringify(enc.decode(enc.encode(r))));
+		const learn = {}; for (let k = 0; k < 10; k++) learn['k' + k] = { x: 1 };
+		norm(learn);
+		for (let i = 2; i < 300; i++) {
+			const r = { k0: { x: 1 }, ['k' + i]: { x: 1 } };
+			assert.deepStrictEqual(norm(r), r);
+		}
+		assert.ok(enc.typedStructs.length <= 4, 'nested-object variant stream must stay within the cap, got ' + enc.typedStructs.length);
+	});
+
 	test('new Structon(null) does not throw (null options = use defaults)', function () {
 		const enc = new Structon(null);
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(enc.decode(enc.encode({ a: 1 })))), { a: 1 });
