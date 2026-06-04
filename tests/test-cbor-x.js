@@ -237,3 +237,54 @@ suite('structon (cbor-x base) – format details', function () {
 		assert.strictEqual(msgpackResult.meta.x, 10);
 	});
 });
+
+// ── maxOwnStructures cap (standalone path) ────────────────────────────────────
+//
+// Same cap behavior as the msgpackr fast path, exercised through cbor-x's
+// standalone encode (_encode in struct.js). Sparse, width-heterogeneous records
+// would otherwise grow typedStructs without bound; maxOwnStructures freezes the
+// dictionary and falls back to plain encoding once the cap is hit.
+
+suite('structon (cbor-x base) – maxOwnStructures cap', function () {
+	function plain(d) {
+		if (d && typeof d.toJSON === 'function') return d.toJSON();
+		return { ...d };
+	}
+	function makeGen() {
+		let seed = 12345;
+		const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+		return function makeRec() {
+			const o = {};
+			for (let f = 0; f < 40; f++) {
+				if (rnd() < 0.45) continue;
+				const r = (rnd() * 4) | 0;
+				o['f' + f] = r === 0 ? ((rnd() * 200) | 0)
+					: r === 1 ? (((rnd() * 1e6) | 0) + 1000)
+					: r === 2 ? (((rnd() * 1e7) | 0) * 100000)
+					: (((rnd() * 8) | 0) * 0.25);
+			}
+			return o;
+		};
+	}
+	function run(cap) {
+		const enc = new Structon({ randomAccessStructure: true, useRecords: false, maxOwnStructures: cap });
+		const gen = makeGen();
+		for (let i = 0; i < 4000; i++) {
+			const r = gen();
+			assert.deepStrictEqual(plain(enc.decode(enc.encode(r))), r);
+		}
+		return enc.typedStructs.length;
+	}
+
+	test('uncapped dictionary grows well past 256 for width-heterogeneous records', function () {
+		assert.ok(run(undefined) > 256, 'expected uncapped typedStructs to exceed 256');
+	});
+
+	test('cap=64 bounds typedStructs and preserves round-trips', function () {
+		assert.ok(run(64) <= 64, 'typedStructs should not exceed the cap of 64');
+	});
+
+	test('cap=256 bounds typedStructs and preserves round-trips', function () {
+		assert.ok(run(256) <= 256, 'typedStructs should not exceed the cap of 256');
+	});
+});

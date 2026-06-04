@@ -520,3 +520,59 @@ suite('structon – struct-write disabled stays records-mode / v1-decodable', fu
 		assert.ok(enc.encode(31)[0] < 0x20, 'values below the struct range stay positive fixints');
 	});
 });
+
+// ── maxOwnStructures cap (fast path) ──────────────────────────────────────────
+//
+// typedStructs is append-only and pinned on the long-lived encoder. The encoder
+// branches per-field on value width (num8/num32/num64, float32/float64), so a
+// sparse, width-heterogeneous schema mints a distinct structure for every
+// (key-set × width-combination) — far more than the number of distinct key-sets.
+// maxOwnStructures bounds that growth: once the cap is reached, novel shapes fall
+// back to plain encoding (useRecords:false → msgpack maps here) instead of growing
+// the dictionary, and everything still round-trips.
+
+suite('structon – maxOwnStructures cap', function () {
+	// Normalize a decoded record (lazy struct or plain map) to a comparable plain object.
+	function plain(d) {
+		if (d && typeof d.toJSON === 'function') return d.toJSON();
+		return { ...d };
+	}
+	// Deterministic PRNG so the generated shape space is reproducible.
+	function makeGen() {
+		let seed = 12345;
+		const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+		return function makeRec() {
+			const o = {};
+			for (let f = 0; f < 40; f++) {
+				if (rnd() < 0.45) continue; // field absent ~45% of the time
+				const r = (rnd() * 4) | 0; // value width varies: u8 / u32 / large / float
+				o['f' + f] = r === 0 ? ((rnd() * 200) | 0)
+					: r === 1 ? (((rnd() * 1e6) | 0) + 1000)
+					: r === 2 ? (((rnd() * 1e7) | 0) * 100000)
+					: (((rnd() * 8) | 0) * 0.25);
+			}
+			return o;
+		};
+	}
+	function run(cap) {
+		const enc = new Structon({ randomAccessStructure: true, useRecords: false, maxOwnStructures: cap });
+		const gen = makeGen();
+		for (let i = 0; i < 4000; i++) {
+			const r = gen();
+			assert.deepStrictEqual(plain(enc.decode(enc.encode(r))), r);
+		}
+		return enc.typedStructs.length;
+	}
+
+	test('uncapped dictionary grows well past 256 for width-heterogeneous records', function () {
+		assert.ok(run(undefined) > 256, 'expected uncapped typedStructs to exceed 256');
+	});
+
+	test('cap=64 bounds typedStructs and preserves round-trips', function () {
+		assert.ok(run(64) <= 64, 'typedStructs should not exceed the cap of 64');
+	});
+
+	test('cap=256 bounds typedStructs and preserves round-trips', function () {
+		assert.ok(run(256) <= 256, 'typedStructs should not exceed the cap of 256');
+	});
+});

@@ -38,6 +38,11 @@ export function createStructon(BaseClass) {
 		constructor(options = {}) {
 			super(options);
 
+			// Honor maxOwnStructures for the typed-struct path: bounds the per-encoder typed-structure
+			// dictionary (+ transition trie). Once reached, novel shapes fall back to plain encoding
+			// instead of growing the dictionary without limit. Default: uncapped (no behavior change).
+			if (options.maxOwnStructures != null) this.maxOwnStructures = options.maxOwnStructures;
+
 			// Initialise typed structures state on this instance
 			if (!this.typedStructs) this.typedStructs = [];
 

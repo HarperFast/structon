@@ -120,9 +120,20 @@ function createBlankTransition(key, parent) {
 	};
 }
 
+// When the typed-structure dictionary reaches maxOwnStructures we stop minting new
+// structures/transitions. typedStructs is append-only and pinned on the long-lived
+// encoder (records reference structures by recordId), so an unbounded shape space —
+// e.g. a wide, sparsely/variably-populated schema — would otherwise grow the
+// dictionary + transition trie without limit. While frozen, a missing transition
+// returns undefined so the caller bails and the record falls back to plain encoding.
+let _frozen = false;
+
 function createTypeTransition(transition, type, size) {
 	const typeName = TYPE_NAMES[type] + (size << 3);
-	let t = transition[typeName] || (transition[typeName] = Object.create(null));
+	let t = transition[typeName];
+	if (t) return t;
+	if (_frozen) return undefined;
+	t = transition[typeName] = Object.create(null);
 	t.__type = type;
 	t.__size = size;
 	t.__parent = transition;
@@ -248,6 +259,7 @@ function _writeHeader(result, recordId, headerSize) {
 export function writeStructInPlace(object, target, encodingStart, position, structures, makeRoom, pack) {
 	const packr = this;
 	let typedStructs = packr.typedStructs || (packr.typedStructs = []);
+	_frozen = typedStructs.length >= (packr.maxOwnStructures ?? Infinity);
 	let targetView = target.dataView;
 	let refsStartPosition = (typedStructs.lastStringStart || 100) + position;
 	let safeEnd = target.length - 10;
@@ -281,6 +293,7 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 		let value = object[key];
 		let nextTransition = transition[key];
 		if (!nextTransition) {
+			if (_frozen) return 0;
 			transition[key] = nextTransition = {
 				key, parent: transition, enumerationOffset: 0,
 				ascii0: null, ascii8: null, num8: null,
@@ -457,6 +470,7 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 			default:
 				queuedReferences.push(key, value, keyIndex);
 		}
+		if (transition === undefined) return 0; // frozen: structure cap reached
 		keyIndex++;
 	}
 
@@ -466,6 +480,7 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 		let propertyIndex = queuedReferences[i++];
 		let nextTransition = transition[key];
 		if (!nextTransition) {
+			if (_frozen) return 0;
 			transition[key] = nextTransition = {
 				key, parent: transition,
 				enumerationOffset: propertyIndex - keyIndex,
@@ -507,11 +522,13 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 			targetView.setInt16(position, value === null ? -10 : -9, true);
 			position += 2;
 		}
+		if (transition === undefined) return 0; // frozen: structure cap reached
 		keyIndex++;
 	}
 
 	let recordId = transition[RECORD_SYMBOL];
 	if (recordId == null) {
+		if (_frozen) return 0;
 		recordId = packr.typedStructs.length;
 		const structure = [];
 		let nextTransition = transition;
@@ -618,6 +635,7 @@ export function writeStruct(object, encodeNested, packr) {
 
 function _encode(object, encodeNested, packr, work) {
 	let typedStructs = packr.typedStructs || (packr.typedStructs = []);
+	_frozen = typedStructs.length >= (packr.maxOwnStructures ?? Infinity);
 	let transition = typedStructs.transitions || (typedStructs.transitions = Object.create(null));
 
 	const nextId = typedStructs.length;
@@ -639,6 +657,7 @@ function _encode(object, encodeNested, packr, work) {
 		const value = object[key];
 		let nextTransition = transition[key];
 		if (!nextTransition) {
+			if (_frozen) return null;
 			transition[key] = nextTransition = createBlankTransition(key, transition);
 		}
 		if (fixedPos + 8 > work.fixedBuf.length) _growFixed(work, fixedPos + 8);
@@ -759,6 +778,7 @@ function _encode(object, encodeNested, packr, work) {
 				queuedReferences.push(key, value, keyIndex);
 				break;
 		}
+		if (transition === undefined) return null; // frozen: structure cap reached
 		keyIndex++;
 	}
 
@@ -771,6 +791,7 @@ function _encode(object, encodeNested, packr, work) {
 
 		let nextTransition = transition[key];
 		if (!nextTransition) {
+			if (_frozen) return null;
 			transition[key] = nextTransition = {
 				key,
 				parent: transition,
@@ -808,12 +829,14 @@ function _encode(object, encodeNested, packr, work) {
 			work.fixedView.setInt16(fixedPos, value === null ? -10 : -9, true);
 			fixedPos += 2;
 		}
+		if (transition === undefined) return null; // frozen: structure cap reached
 		keyIndex++;
 	}
 
 	// Build/retrieve structure definition from the transition chain.
 	let recordId = transition[RECORD_SYMBOL];
 	if (recordId == null) {
+		if (_frozen) return null;
 		recordId = typedStructs.length;
 		const structure = [];
 		let t = transition;
