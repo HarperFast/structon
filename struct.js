@@ -502,6 +502,10 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 				transition = nextTransition.object32 || createTypeTransition(nextTransition, OBJECT_DATA, 4);
 				size = 4;
 			}
+			// Must bail BEFORE pack(): on the fast path pack() advances the shared encoder
+			// position, so a later `return 0` would make the plain-object fallback start at
+			// the wrong offset and emit garbage. Returning here leaves position untouched.
+			if (transition === undefined) return 0; // frozen: structure cap reached
 			newPosition = pack(value, refPosition);
 			if (typeof newPosition === 'object') {
 				// re-allocated buffer — refresh local refs

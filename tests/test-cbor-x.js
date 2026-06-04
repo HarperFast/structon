@@ -288,7 +288,7 @@ suite('structon (cbor-x base) – maxOwnStructures cap', function () {
 		assert.ok(run(256) <= 256, 'typedStructs should not exceed the cap of 256');
 	});
 
-	test('nested records do not overshoot the cap', function () {
+	test('nested records do not overshoot the cap and still round-trip', function () {
 		// A nested object mints its own structure before the outer record is minted, so a
 		// stale entry-time freeze flag could let the outer record push past the cap. The mint
 		// guard re-checks the live length, keeping typedStructs.length a hard bound.
@@ -296,9 +296,25 @@ suite('structon (cbor-x base) – maxOwnStructures cap', function () {
 		let seed = 7;
 		const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
 		for (let i = 0; i < 1000; i++) {
-			enc.encode({ outer: { inner: (rnd() * 1e7 | 0) * 1000 }, tag: 't' + (i % 20), n: (rnd() * 300 | 0) });
+			const r = { outer: { inner: (rnd() * 1e7 | 0) * 1000 }, tag: 't' + (i % 20), n: (rnd() * 300 | 0) };
+			// JSON round-trip normalizes lazy structs / strips prototypes for deep-equality.
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(enc.decode(enc.encode(r)))), r);
 		}
 		assert.ok(enc.typedStructs.length <= 4, 'nested encodes must not push typedStructs past the cap, got ' + enc.typedStructs.length);
+	});
+
+	test('capped: a known key later seen as a nested object falls back cleanly', function () {
+		// Once frozen, a previously-learned scalar key that later carries an object must fall
+		// back to plain encoding cleanly (standalone path returns fresh buffers, no shared state).
+		const enc = new Structon({ structures: [], useRecords: false, maxOwnStructures: 1 });
+		assert.deepStrictEqual(JSON.parse(JSON.stringify(enc.decode(enc.encode({ a: 1 })))), { a: 1 });
+		const r2 = { a: { x: 1 } };
+		assert.deepStrictEqual(JSON.parse(JSON.stringify(enc.decode(enc.encode(r2)))), r2);
+	});
+
+	test('new Structon(null) does not throw (null options = use defaults)', function () {
+		const enc = new Structon(null);
+		assert.deepStrictEqual(JSON.parse(JSON.stringify(enc.decode(enc.encode({ a: 1 })))), { a: 1 });
 	});
 
 	test('persisted structures still load after a capped encoder froze the dictionary', function () {
