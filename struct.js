@@ -1139,7 +1139,11 @@ export function onLoadedStructures(sharedData) {
  * Wraps structures for saving in the same Map format as msgpackr's struct.js.
  */
 export function prepareStructures(structures, packr) {
-	if (packr.typedStructs) {
+	// Only wrap in the {named, typed} Map when there are actually typed structs to save.
+	// With none, emit the legacy plain-array form so the saved structures are byte-identical
+	// to plain msgpackr and remain decodable by readers without struct support (the read path
+	// in onLoadedStructures already accepts the plain-array form).
+	if (packr.typedStructs && packr.typedStructs.length) {
 		const m = new Map();
 		m.set('named', structures);
 		m.set('typed', packr.typedStructs);

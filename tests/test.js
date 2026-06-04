@@ -439,3 +439,69 @@ suite('structon – shared data round-tripped through the encoder', function () 
 		assert.deepStrictEqual(materialize(result).permission, { super_user: true });
 	});
 });
+
+// ── struct-write disabled: records-mode output stays decodable without struct support ──
+//
+// A host can clear `_writeStruct` to fall back to plain msgpackr records mode while keeping
+// `_readStruct` so it can still decode previously-written struct data. For that to be
+// downgrade-safe, prepareStructures must save the shared structures in the legacy plain-array
+// form (not the {named,typed} Map) whenever there are no typed structs — otherwise a reader
+// without struct support (msgpackr v1 / no randomAccessStructure) can't load the structures
+// and fails to resolve record references.
+
+suite('structon – struct-write disabled stays records-mode / v1-decodable', function () {
+	test('no typed structs: saved structures are a plain array, not a Map', function () {
+		let saved = null;
+		const enc = new Structon({
+			structures: [],
+			saveStructures(structures) { saved = structures; return true; },
+			getStructures() { return saved; },
+		});
+		enc._writeStruct = undefined; // records-mode writes; struct reads retained
+
+		const buf = enc.encode({ name: 'compat', value: 42 });
+		assert.ok(buf[0] < 0x20 || buf[0] >= 0x40, 'expected records-mode byte, not a struct header');
+		assert.ok(Array.isArray(saved), 'structures should be saved as a plain array when there are no typed structs');
+	});
+
+	test('records-mode output + plain-array structures decode on a v1 reader without randomAccessStructure', function () {
+		let savedBuffer = null;
+		const writer = new Structon({
+			structures: [],
+			saveStructures(structures) { savedBuffer = writer.encode(structures); return true; },
+			getStructures() { return savedBuffer ? writer.decode(savedBuffer) : undefined; },
+		});
+		writer._writeStruct = undefined;
+
+		const buf = writer.encode({ name: 'compat', value: 42, active: true });
+
+		// Plain msgpackr v1 reader, NO randomAccessStructure, fed the saved structures.
+		const legacyStructures = savedBuffer ? new LegacyPackr().decode(savedBuffer) : [];
+		assert.ok(Array.isArray(legacyStructures), 'saved structures must be a plain array for a v1 reader');
+		const legacy = new LegacyPackr({ useRecords: true, structures: legacyStructures });
+		const result = legacy.unpack(buf);
+		assert.strictEqual(result.name, 'compat');
+		assert.strictEqual(result.value, 42);
+		assert.strictEqual(result.active, true);
+	});
+
+	test('struct reads still work with struct writes disabled (existing struct data stays readable)', function () {
+		let savedBuffer = null;
+		const oldEnc = new Structon({
+			structures: [],
+			saveStructures(structures) { savedBuffer = oldEnc.encode(structures); return true; },
+			getStructures() { return savedBuffer ? oldEnc.decode(savedBuffer) : undefined; },
+		});
+		const structBuf = oldEnc.encode({ name: 'legacy', value: 7 });
+		assert.ok(structBuf[0] >= 0x20 && structBuf[0] < 0x40, 'old encoder should produce struct bytes');
+
+		const newEnc = new Structon({
+			structures: [],
+			getStructures() { return savedBuffer ? newEnc.decode(savedBuffer) : undefined; },
+		});
+		newEnc._writeStruct = undefined;
+		const result = newEnc.decode(structBuf);
+		assert.strictEqual(materialize(result).name, 'legacy');
+		assert.strictEqual(materialize(result).value, 7);
+	});
+});
