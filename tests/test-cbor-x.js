@@ -312,6 +312,15 @@ suite('structon (cbor-x base) – maxOwnStructures cap', function () {
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(enc.decode(enc.encode(r2)))), r2);
 	});
 
+	test('capped: a frozen miss after an earlier nested ref still round-trips', function () {
+		const enc = new Structon({ structures: [], useRecords: false, maxOwnStructures: 2 });
+		const norm = (r) => JSON.parse(JSON.stringify(enc.decode(enc.encode(r))));
+		assert.deepStrictEqual(norm({ b: 1 }), { b: 1 });
+		assert.deepStrictEqual(norm({ a: { x: 1 } }), { a: { x: 1 } });
+		const r = { a: { x: 1 }, b: { y: 2 } };
+		assert.deepStrictEqual(norm(r), r);
+	});
+
 	test('new Structon(null) does not throw (null options = use defaults)', function () {
 		const enc = new Structon(null);
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(enc.decode(enc.encode({ a: 1 })))), { a: 1 });
