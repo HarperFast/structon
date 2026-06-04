@@ -490,10 +490,29 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 		keyIndex++;
 	}
 
-	// Once we pack() a queued nested value, msgpackr's shared write position is advanced and
-	// a `return 0` would corrupt the plain-object fallback. So: while no ref has been packed
-	// yet, a frozen miss bails cleanly (return 0). After the first pack we can no longer bail,
-	// so we force-mint whatever the remaining fields need (bounded overshoot — see below).
+	// Cap enforcement for queued (nested-object / null) references. pack() advances msgpackr's
+	// shared write position and we cannot cleanly bail afterward, so preflight the whole queued
+	// chain through EXISTING transitions first: if the cap is reached and any field would need a
+	// new structure, fall back to plain encoding now (return 0) — before touching the shared
+	// position. A fresh length check is used (not the entry-time _frozen, which a re-entrant
+	// nested pack on a prior field may have advanced).
+	if (queuedReferences.length > 0 && packr.typedStructs.length >= (packr.maxOwnStructures ?? Infinity)) {
+		let t = transition;
+		for (let i = 0, l = queuedReferences.length; i < l; i += 3) {
+			const nt = t[queuedReferences[i]];
+			if (!nt) return 0;
+			const next = queuedReferences[i + 1] != null ? (nt.object16 || nt.object32) : nt.object16;
+			if (!next) return 0;
+			t = next;
+		}
+		if (t[RECORD_SYMBOL] == null) return 0; // exact structure not yet minted
+	}
+
+	// Past the preflight the chain is known, so no minting happens — except a rare offset
+	// divergence (a known shape whose ref section now crosses 0xff00 and needs object32 where
+	// the preflight matched object16). Once a ref is packed we can no longer bail, so we finish
+	// via the unfrozen forceTypeTransition: a bounded, self-converging overshoot for that one
+	// record. packedRef keeps the record-id mint from bailing after a pack.
 	let packedRef = false;
 	for (let i = 0, l = queuedReferences.length; i < l;) {
 		let key = queuedReferences[i++];
@@ -501,7 +520,6 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 		let propertyIndex = queuedReferences[i++];
 		let nextTransition = transition[key];
 		if (!nextTransition) {
-			if (_frozen && !packedRef) return 0;
 			transition[key] = nextTransition = {
 				key, parent: transition,
 				enumerationOffset: propertyIndex - keyIndex,
@@ -518,16 +536,9 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 				transition = nextTransition.object16;
 				if (transition) size = 2;
 				else if ((transition = nextTransition.object32)) size = 4;
-				else {
-					if (_frozen && !packedRef) return 0; // clean bail before any pack()
-					transition = forceTypeTransition(nextTransition, OBJECT_DATA, 2); size = 2;
-				}
+				else { transition = forceTypeTransition(nextTransition, OBJECT_DATA, 2); size = 2; }
 			} else {
-				transition = nextTransition.object32;
-				if (!transition) {
-					if (_frozen && !packedRef) return 0; // clean bail before any pack()
-					transition = forceTypeTransition(nextTransition, OBJECT_DATA, 4);
-				}
+				transition = nextTransition.object32 || forceTypeTransition(nextTransition, OBJECT_DATA, 4);
 				size = 4;
 			}
 			newPosition = pack(value, refPosition);
@@ -547,11 +558,7 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 			if (size === 2) { targetView.setUint16(position, refOffset, true); position += 2; }
 			else            { targetView.setUint32(position, refOffset, true); position += 4; }
 		} else { // null or undefined
-			transition = nextTransition.object16;
-			if (!transition) {
-				if (_frozen && !packedRef) return 0; // clean bail before any pack()
-				transition = forceTypeTransition(nextTransition, OBJECT_DATA, 2);
-			}
+			transition = nextTransition.object16 || forceTypeTransition(nextTransition, OBJECT_DATA, 2);
 			targetView.setInt16(position, value === null ? -10 : -9, true);
 			position += 2;
 		}
@@ -560,9 +567,9 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 
 	let recordId = transition[RECORD_SYMBOL];
 	if (recordId == null) {
-		// Enforce the cap here only while nothing has been packed (flat records and the
-		// no-queued-refs case): bailing after a pack would corrupt the fallback, so a record
-		// that already packed nested refs completes and may mint a bounded few past the cap.
+		// Flat records (no queued refs) reach here without packing, so the cap is enforced
+		// cleanly. Records that packed nested refs already passed the preflight (record id
+		// exists) or are completing a bounded overshoot; either way bailing now would corrupt.
 		if (!packedRef && packr.typedStructs.length >= (packr.maxOwnStructures ?? Infinity)) return 0;
 		recordId = packr.typedStructs.length;
 		const structure = [];
