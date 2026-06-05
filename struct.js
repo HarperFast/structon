@@ -498,10 +498,17 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 	// nested pack on a prior field may have advanced).
 	if (queuedReferences.length > 0 && packr.typedStructs.length >= (packr.maxOwnStructures ?? Infinity)) {
 		let t = transition;
+		let objectRefs = 0;
 		for (let i = 0, l = queuedReferences.length; i < l; i += 3) {
+			const v = queuedReferences[i + 1];
+			// A second packed ref can land at a ref-section offset >= 0xff00 and need an object32
+			// structure variant that may not exist; post-pack we couldn't mint it without exceeding
+			// the cap. A single packed ref is always at offset 0 (object16) and can't diverge, so
+			// only records with >= 2 packed refs need to fall back to plain encoding under the cap.
+			if (v != null && ++objectRefs >= 2) return 0;
 			const nt = t[queuedReferences[i]];
 			if (!nt) return 0;
-			const next = queuedReferences[i + 1] != null ? (nt.object16 || nt.object32) : nt.object16;
+			const next = v != null ? (nt.object16 || nt.object32) : nt.object16;
 			if (!next) return 0;
 			t = next;
 		}
