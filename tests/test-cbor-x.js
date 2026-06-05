@@ -381,4 +381,18 @@ suite('structon (cbor-x base) – maxOwnStructures cap', function () {
 		assert.strictEqual(result.name, 'Alice');
 		assert.strictEqual(result.age, 30);
 	});
+
+	test('a capped plain-fallback does not strand previously-persisted typed structures', function () {
+		// Regression: on a capped miss the record falls back to plain base encoding, which may
+		// persist only the base named structures via saveStructures — overwriting the saved
+		// {named, typed} payload. A fresh reader must still decode the earlier struct buffer.
+		let saved = null;
+		const writer = new Structon({ structures: [], maxOwnStructures: 1, saveStructures(s) { saved = s; return true; }, getStructures() { return saved; } });
+		const buf1 = writer.encode({ x: 1 });        // mints typed structure 0
+		const buf2 = writer.encode({ y: 2, z: 3 });  // capped miss → plain fallback
+
+		const reader = new Structon({ structures: [], getStructures() { return saved; } });
+		assert.deepStrictEqual(JSON.parse(JSON.stringify(reader.decode(buf1))), { x: 1 });
+		assert.deepStrictEqual(JSON.parse(JSON.stringify(reader.decode(buf2))), { y: 2, z: 3 });
+	});
 });
