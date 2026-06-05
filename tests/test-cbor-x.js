@@ -333,6 +333,18 @@ suite('structon (cbor-x base) – maxOwnStructures cap', function () {
 		assert.ok(enc.typedStructs.length <= 4, 'nested-object variant stream must stay within the cap, got ' + enc.typedStructs.length);
 	});
 
+	test('capped: wide nested refs (ref offset > 0xff00) stay a hard bound', function () {
+		const enc = new Structon({ structures: [], useRecords: false, maxOwnStructures: 1 });
+		const norm = (r) => JSON.parse(JSON.stringify(enc.decode(enc.encode(r))));
+		norm({ a: { x: '1' }, b: { y: 1 } });
+		const big = 'z'.repeat(70000);
+		for (let i = 0; i < 30; i++) {
+			const r = { a: { x: big + i }, b: { y: i } };
+			assert.deepStrictEqual(norm(r), r);
+		}
+		assert.ok(enc.typedStructs.length <= 1, 'wide multi-ref records must not exceed the cap, got ' + enc.typedStructs.length);
+	});
+
 	test('new Structon(null) does not throw (null options = use defaults)', function () {
 		const enc = new Structon(null);
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(enc.decode(enc.encode({ a: 1 })))), { a: 1 });
