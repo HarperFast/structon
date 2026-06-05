@@ -272,10 +272,13 @@ function _writeHeader(result, recordId, headerSize) {
  * @param {function} pack             - pack a nested value at a given position
  * @returns {number} new write position, or 0 to bail (fall back to plain object)
  */
-export function writeStructInPlace(object, target, encodingStart, position, structures, makeRoom, pack) {
+export function writeStructInPlace(object, target, encodingStart, position, structures, makeRoom, pack, structureKnown) {
 	const packr = this;
 	let typedStructs = packr.typedStructs || (packr.typedStructs = []);
-	_frozen = typedStructs.length >= (packr.maxOwnStructures ?? Infinity);
+	// structureKnown is set only on the internal layout-retry below: attempt 1 already minted
+	// this record's structure, so the retry re-encodes a known shape and must not re-apply the
+	// cap (which could otherwise bail after attempt 1 already packed refs → corrupt fallback).
+	_frozen = !structureKnown && typedStructs.length >= (packr.maxOwnStructures ?? Infinity);
 	let targetView = target.dataView;
 	let refsStartPosition = (typedStructs.lastStringStart || 100) + position;
 	let safeEnd = target.length - 10;
@@ -496,19 +499,19 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 	// new structure, fall back to plain encoding now (return 0) — before touching the shared
 	// position. A fresh length check is used (not the entry-time _frozen, which a re-entrant
 	// nested pack on a prior field may have advanced).
-	if (queuedReferences.length > 0 && packr.typedStructs.length >= (packr.maxOwnStructures ?? Infinity)) {
+	if (_frozen && queuedReferences.length > 0) {
 		let t = transition;
-		let objectRefs = 0;
 		for (let i = 0, l = queuedReferences.length; i < l; i += 3) {
-			const v = queuedReferences[i + 1];
-			// A second packed ref can land at a ref-section offset >= 0xff00 and need an object32
-			// structure variant that may not exist; post-pack we couldn't mint it without exceeding
-			// the cap. A single packed ref is always at offset 0 (object16) and can't diverge, so
-			// only records with >= 2 packed refs need to fall back to plain encoding under the cap.
-			if (v != null && ++objectRefs >= 2) return 0;
+			// A non-null (object/Date) ref is pack()ed into the shared buffer, advancing
+			// msgpackr's write position. Its structure variant (object16 vs object32) depends on
+			// the runtime ref-section offset (inline strings + earlier refs), which we can't know
+			// before packing — and we can't bail after a pack without corrupting the fallback. So
+			// under the cap, any record with a packing ref falls back to plain encoding now,
+			// before any pack(). null/undefined refs don't pack, so they're walked normally.
+			if (queuedReferences[i + 1] != null) return 0;
 			const nt = t[queuedReferences[i]];
 			if (!nt) return 0;
-			const next = v != null ? (nt.object16 || nt.object32) : nt.object16;
+			const next = nt.object16; // null/undefined ref → OBJECT_DATA size 2
 			if (!next) return 0;
 			t = next;
 		}
@@ -626,9 +629,12 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 		typedStructs.lastStringStart = position - start;
 	} else if (position > refsStartPosition) {
 		if (refsStartPosition === refPosition) return position; // no refs
-		// fixed section overflowed our estimate — retry with the corrected size
+		// fixed section overflowed our estimate — retry with the corrected size. The structure
+		// is already minted at this point, so pass structureKnown=true to skip the cap check
+		// (otherwise a record that became frozen during attempt 1 would bail mid-retry, after
+		// refs were already packed, and corrupt the fallback).
 		typedStructs.lastStringStart = position - start;
-		return writeStructInPlace.call(packr, object, target, encodingStart, start, structures, makeRoom, pack);
+		return writeStructInPlace.call(packr, object, target, encodingStart, start, structures, makeRoom, pack, true);
 	}
 	return refPosition;
 }
