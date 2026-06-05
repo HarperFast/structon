@@ -80,6 +80,13 @@ export function createStructon(BaseClass) {
 						}
 						return encoded;
 					}
+					// Capped miss: fall back to plain base encoding. The base may persist its own
+					// named structures via saveStructures, overwriting our combined {named, typed}
+					// payload and stranding previously written struct data. Re-save afterward so the
+					// typed structures survive (this.structures now also holds any base record added).
+					const result = superEncode(value, encodeOptions);
+					if (this.typedStructs && this.typedStructs.length > 0) this._saveTypedStructures();
+					return result;
 				} finally {
 					this._onStructureAdded = null;
 				}
