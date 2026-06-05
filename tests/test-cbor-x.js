@@ -395,4 +395,19 @@ suite('structon (cbor-x base) – maxOwnStructures cap', function () {
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(reader.decode(buf1))), { x: 1 });
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(reader.decode(buf2))), { y: 2, z: 3 });
 	});
+
+	test('the cap is per-instance: a re-entrant encode on another instance cannot lift it', function () {
+		// Regression: the freeze decision must be derived from THIS instance's typedStructs, not a
+		// shared module flag. An enumerable getter that encodes with an uncapped instance during
+		// iteration must not flip the capped instance's freeze state and let it mint past the cap.
+		const uncapped = new Structon({ structures: [], useRecords: false });
+		const capped = new Structon({ structures: [], useRecords: false, maxOwnStructures: 0 });
+		for (let i = 0; i < 20; i++) {
+			const obj = { a: i };
+			Object.defineProperty(obj, 'g', { enumerable: true, get() { uncapped.encode({ deep: { n: i }, ['k' + i]: i }); return { x: i }; } });
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(capped.decode(capped.encode(obj)))), { a: i, g: { x: i } });
+		}
+		assert.strictEqual(capped.typedStructs.length, 0, 'maxOwnStructures:0 must mint no typed structures');
+		assert.ok(uncapped.typedStructs.length > 0, 'the uncapped instance should still grow');
+	});
 });

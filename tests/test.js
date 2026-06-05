@@ -705,4 +705,21 @@ suite('structon – maxOwnStructures cap', function () {
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(reader.decode(buf1))), { x: 1 });
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(reader.decode(buf2))), { y: 2, z: 3 });
 	});
+
+	test('the cap is per-instance: another encoder growing does not lift this one', function () {
+		// The freeze decision is derived from THIS instance's typedStructs, not a shared module
+		// flag — so an uncapped sibling encoder churning out structures can't lift the cap here.
+		const uncapped = new Structon({ structures: [], useRecords: false });
+		const capped = new Structon({ structures: [], useRecords: false, maxOwnStructures: 2 });
+		let seed = 1;
+		const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+		const mk = () => { const o = {}; for (let f = 0; f < 20; f++) if (rnd() < 0.5) o['f' + f] = (rnd() * 1e7 | 0); return o; };
+		for (let i = 0; i < 500; i++) {
+			uncapped.encode(mk()); // grows the sibling's dictionary freely
+			const r = mk();
+			assert.deepStrictEqual(JSON.parse(JSON.stringify(capped.decode(capped.encode(r)))), r);
+		}
+		assert.ok(capped.typedStructs.length <= 2, 'capped must stay bounded regardless of the sibling, got ' + capped.typedStructs.length);
+		assert.ok(uncapped.typedStructs.length > 2, 'the uncapped sibling should grow past 2');
+	});
 });

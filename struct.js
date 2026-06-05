@@ -124,15 +124,15 @@ function createBlankTransition(key, parent) {
 // structures/transitions. typedStructs is append-only and pinned on the long-lived
 // encoder (records reference structures by recordId), so an unbounded shape space —
 // e.g. a wide, sparsely/variably-populated schema — would otherwise grow the
-// dictionary + transition trie without limit. While frozen, a missing transition
-// returns undefined so the caller bails and the record falls back to plain encoding.
-let _frozen = false;
-
-function createTypeTransition(transition, type, size) {
+// dictionary + transition trie without limit. `frozen` is passed in (derived from the
+// encoding instance's own typedStructs.length, never a shared global) so a re-entrant
+// encode on another instance can't flip it; while frozen, a missing transition returns
+// undefined so the caller bails and the record falls back to plain encoding.
+function createTypeTransition(transition, type, size, frozen) {
 	const typeName = TYPE_NAMES[type] + (size << 3);
 	let t = transition[typeName];
 	if (t) return t;
-	if (_frozen) return undefined;
+	if (frozen) return undefined;
 	t = transition[typeName] = Object.create(null);
 	t.__type = type;
 	t.__size = size;
@@ -278,7 +278,9 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 	// structureKnown is set only on the internal layout-retry below: attempt 1 already minted
 	// this record's structure, so the retry re-encodes a known shape and must not re-apply the
 	// cap (which could otherwise bail after attempt 1 already packed refs → corrupt fallback).
-	_frozen = !structureKnown && typedStructs.length >= (packr.maxOwnStructures ?? Infinity);
+	// `frozen` is a local (from this instance's typedStructs) — never a shared global — so a
+	// re-entrant encode on another instance (e.g. via an enumerable getter) can't flip it.
+	const frozen = !structureKnown && typedStructs.length >= (packr.maxOwnStructures ?? Infinity);
 	let targetView = target.dataView;
 	let refsStartPosition = (typedStructs.lastStringStart || 100) + position;
 	let safeEnd = target.length - 10;
@@ -312,7 +314,7 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 		let value = object[key];
 		let nextTransition = transition[key];
 		if (!nextTransition) {
-			if (_frozen) return 0;
+			if (frozen) return 0;
 			transition[key] = nextTransition = {
 				key, parent: transition, enumerationOffset: 0,
 				ascii0: null, ascii8: null, num8: null,
@@ -340,10 +342,10 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 							(nextTransition.num8 && !(nextId > 200 && nextTransition.num32) ||
 							 number < 0x20 && !nextTransition.num32)
 						) {
-							transition = nextTransition.num8 || createTypeTransition(nextTransition, NUMBER, 1);
+							transition = nextTransition.num8 || createTypeTransition(nextTransition, NUMBER, 1, frozen);
 							target[position++] = number;
 						} else {
-							transition = nextTransition.num32 || createTypeTransition(nextTransition, NUMBER, 4);
+							transition = nextTransition.num32 || createTypeTransition(nextTransition, NUMBER, 4, frozen);
 							targetView.setUint32(position, number, true);
 							position += 4;
 						}
@@ -353,14 +355,14 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 						if (float32Headers[target[position + 3] >>> 5]) {
 							let xShifted;
 							if (((xShifted = number * mult10[((target[position + 3] & 0x7f) << 1) | (target[position + 2] >> 7)]) >> 0) === xShifted) {
-								transition = nextTransition.num32 || createTypeTransition(nextTransition, NUMBER, 4);
+								transition = nextTransition.num32 || createTypeTransition(nextTransition, NUMBER, 4, frozen);
 								position += 4;
 								break;
 							}
 						}
 					}
 				}
-				transition = nextTransition.num64 || createTypeTransition(nextTransition, NUMBER, 8);
+				transition = nextTransition.num64 || createTypeTransition(nextTransition, NUMBER, 8, frozen);
 				targetView.setFloat64(position, number, true);
 				position += 8;
 				break;
@@ -433,20 +435,20 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 								nextTransition.string8 = transition;
 								pack(null, 0, true); // notify structure update
 							} else {
-								transition = createTypeTransition(nextTransition, UTF8, 1);
+								transition = createTypeTransition(nextTransition, UTF8, 1, frozen);
 							}
 						}
 					} else if (refOffset === 0 && !usedAscii0) {
 						usedAscii0 = true;
-						transition = nextTransition.ascii0 || createTypeTransition(nextTransition, ASCII, 0);
+						transition = nextTransition.ascii0 || createTypeTransition(nextTransition, ASCII, 0, frozen);
 						break; // size=0: don't increment position
 					} else if (!(transition = nextTransition.ascii8) &&
 							   !(typedStructs.length > 10 && (transition = nextTransition.string8))) {
-						transition = createTypeTransition(nextTransition, ASCII, 1);
+						transition = createTypeTransition(nextTransition, ASCII, 1, frozen);
 					}
 					target[position++] = refOffset;
 				} else {
-					transition = nextTransition.string16 || createTypeTransition(nextTransition, UTF8, 2);
+					transition = nextTransition.string16 || createTypeTransition(nextTransition, UTF8, 2, frozen);
 					targetView.setUint16(position, refOffset, true);
 					position += 2;
 				}
@@ -455,7 +457,7 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 			case 'object': {
 				if (value) {
 					if (value.constructor === Date) {
-						transition = nextTransition.date64 || createTypeTransition(nextTransition, DATE, 8);
+						transition = nextTransition.date64 || createTypeTransition(nextTransition, DATE, 8, frozen);
 						targetView.setFloat64(position, value.getTime(), true);
 						position += 8;
 					} else {
@@ -473,7 +475,7 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 				break;
 			}
 			case 'boolean':
-				transition = nextTransition.num8 || nextTransition.ascii8 || createTypeTransition(nextTransition, NUMBER, 1);
+				transition = nextTransition.num8 || nextTransition.ascii8 || createTypeTransition(nextTransition, NUMBER, 1, frozen);
 				target[position++] = value ? 0xf9 : 0xf8;
 				break;
 			case 'undefined': {
@@ -497,9 +499,8 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 	// shared write position and we cannot cleanly bail afterward, so preflight the whole queued
 	// chain through EXISTING transitions first: if the cap is reached and any field would need a
 	// new structure, fall back to plain encoding now (return 0) — before touching the shared
-	// position. A fresh length check is used (not the entry-time _frozen, which a re-entrant
-	// nested pack on a prior field may have advanced).
-	if (_frozen && queuedReferences.length > 0) {
+	// position. Uses the local `frozen` (this instance's state), immune to cross-instance clobber.
+	if (frozen && queuedReferences.length > 0) {
 		let t = transition;
 		for (let i = 0, l = queuedReferences.length; i < l; i += 3) {
 			// A non-null (object/Date) ref is pack()ed into the shared buffer, advancing
@@ -690,7 +691,10 @@ export function writeStruct(object, encodeNested, packr) {
 
 function _encode(object, encodeNested, packr, work) {
 	let typedStructs = packr.typedStructs || (packr.typedStructs = []);
-	_frozen = typedStructs.length >= (packr.maxOwnStructures ?? Infinity);
+	const cap = packr.maxOwnStructures ?? Infinity;
+	// Local (not a shared global), recomputed after each encodeNested below since a nested
+	// encode on this same instance can mint and grow typedStructs.
+	let frozen = typedStructs.length >= cap;
 	let transition = typedStructs.transitions || (typedStructs.transitions = Object.create(null));
 
 	const nextId = typedStructs.length;
@@ -712,7 +716,7 @@ function _encode(object, encodeNested, packr, work) {
 		const value = object[key];
 		let nextTransition = transition[key];
 		if (!nextTransition) {
-			if (_frozen) return null;
+			if (frozen) return null;
 			transition[key] = nextTransition = createBlankTransition(key, transition);
 		}
 		if (fixedPos + 8 > work.fixedBuf.length) _growFixed(work, fixedPos + 8);
@@ -727,10 +731,10 @@ function _encode(object, encodeNested, packr, work) {
 							(nextTransition.num8 && !(nextId > 200 && nextTransition.num32) ||
 							 number < 0x20 && !nextTransition.num32)
 						) {
-							transition = nextTransition.num8 || createTypeTransition(nextTransition, NUMBER, 1);
+							transition = nextTransition.num8 || createTypeTransition(nextTransition, NUMBER, 1, frozen);
 							work.fixedBuf[fixedPos++] = number;
 						} else {
-							transition = nextTransition.num32 || createTypeTransition(nextTransition, NUMBER, 4);
+							transition = nextTransition.num32 || createTypeTransition(nextTransition, NUMBER, 4, frozen);
 							work.fixedView.setUint32(fixedPos, number, true);
 							fixedPos += 4;
 						}
@@ -740,14 +744,14 @@ function _encode(object, encodeNested, packr, work) {
 						if (float32Headers[work.fixedBuf[fixedPos + 3] >>> 5]) {
 							let xShifted;
 							if (((xShifted = number * mult10[((work.fixedBuf[fixedPos + 3] & 0x7f) << 1) | (work.fixedBuf[fixedPos + 2] >> 7)]) >> 0) === xShifted) {
-								transition = nextTransition.num32 || createTypeTransition(nextTransition, NUMBER, 4);
+								transition = nextTransition.num32 || createTypeTransition(nextTransition, NUMBER, 4, frozen);
 								fixedPos += 4;
 								break;
 							}
 						}
 					}
 				}
-				transition = nextTransition.num64 || createTypeTransition(nextTransition, NUMBER, 8);
+				transition = nextTransition.num64 || createTypeTransition(nextTransition, NUMBER, 8, frozen);
 				work.fixedView.setFloat64(fixedPos, number, true);
 				fixedPos += 8;
 				break;
@@ -770,22 +774,22 @@ function _encode(object, encodeNested, packr, work) {
 								nextTransition.string8 = transition;
 								structureUpdated = true;
 							} else {
-								transition = createTypeTransition(nextTransition, UTF8, 1);
+								transition = createTypeTransition(nextTransition, UTF8, 1, frozen);
 							}
 						}
 						work.fixedBuf[fixedPos++] = curOffset;
 					} else if (curOffset === 0 && !usedAscii0) {
 						usedAscii0 = true;
-						transition = nextTransition.ascii0 || createTypeTransition(nextTransition, ASCII, 0);
+						transition = nextTransition.ascii0 || createTypeTransition(nextTransition, ASCII, 0, frozen);
 						// size=0: no fixed byte written
 					} else {
 						if (!(transition = nextTransition.ascii8) &&
 							!(typedStructs.length > 10 && (transition = nextTransition.string8)))
-							transition = createTypeTransition(nextTransition, ASCII, 1);
+							transition = createTypeTransition(nextTransition, ASCII, 1, frozen);
 						work.fixedBuf[fixedPos++] = curOffset;
 					}
 				} else {
-					transition = nextTransition.string16 || createTypeTransition(nextTransition, UTF8, 2);
+					transition = nextTransition.string16 || createTypeTransition(nextTransition, UTF8, 2, frozen);
 					work.fixedView.setUint16(fixedPos, curOffset, true);
 					fixedPos += 2;
 				}
@@ -794,7 +798,7 @@ function _encode(object, encodeNested, packr, work) {
 
 			case 'object': {
 				if (value && value.constructor === Date) {
-					transition = nextTransition.date64 || createTypeTransition(nextTransition, DATE, 8);
+					transition = nextTransition.date64 || createTypeTransition(nextTransition, DATE, 8, frozen);
 					work.fixedView.setFloat64(fixedPos, value.getTime(), true);
 					fixedPos += 8;
 				} else if (value) {
@@ -814,7 +818,7 @@ function _encode(object, encodeNested, packr, work) {
 
 			case 'boolean':
 				transition = nextTransition.num8 || nextTransition.ascii8 ||
-					createTypeTransition(nextTransition, NUMBER, 1);
+					createTypeTransition(nextTransition, NUMBER, 1, frozen);
 				work.fixedBuf[fixedPos++] = value ? 0xf9 : 0xf8;
 				break;
 
@@ -846,7 +850,7 @@ function _encode(object, encodeNested, packr, work) {
 
 		let nextTransition = transition[key];
 		if (!nextTransition) {
-			if (_frozen) return null;
+			if (frozen) return null;
 			transition[key] = nextTransition = {
 				key,
 				parent: transition,
@@ -861,6 +865,9 @@ function _encode(object, encodeNested, packr, work) {
 
 		if (value != null) {
 			const encoded = encodeNested(value);
+			// encodeNested may have minted on this same instance — refresh the cap state so a
+			// later missing transition still bails instead of minting past the cap.
+			frozen = typedStructs.length >= cap;
 			const curOffset = refsPos;
 			if (refsPos + encoded.length > work.refsBuf.length) _growRefs(work, encoded.length);
 			work.refsBuf.set(encoded, refsPos);
@@ -871,16 +878,16 @@ function _encode(object, encodeNested, packr, work) {
 				transition = nextTransition.object16;
 				if (transition) size = 2;
 				else if ((transition = nextTransition.object32)) size = 4;
-				else { transition = createTypeTransition(nextTransition, OBJECT_DATA, 2); size = 2; }
+				else { transition = createTypeTransition(nextTransition, OBJECT_DATA, 2, frozen); size = 2; }
 			} else {
-				transition = nextTransition.object32 || createTypeTransition(nextTransition, OBJECT_DATA, 4);
+				transition = nextTransition.object32 || createTypeTransition(nextTransition, OBJECT_DATA, 4, frozen);
 				size = 4;
 			}
 			if (size === 2) { work.fixedView.setUint16(fixedPos, curOffset, true); fixedPos += 2; }
 			else            { work.fixedView.setUint32(fixedPos, curOffset, true); fixedPos += 4; }
 		} else {
 			// null or undefined sentinel
-			transition = nextTransition.object16 || createTypeTransition(nextTransition, OBJECT_DATA, 2);
+			transition = nextTransition.object16 || createTypeTransition(nextTransition, OBJECT_DATA, 2, frozen);
 			work.fixedView.setInt16(fixedPos, value === null ? -10 : -9, true);
 			fixedPos += 2;
 		}
@@ -891,10 +898,9 @@ function _encode(object, encodeNested, packr, work) {
 	// Build/retrieve structure definition from the transition chain.
 	let recordId = transition[RECORD_SYMBOL];
 	if (recordId == null) {
-		// Re-check the cap here (not just the entry-time _frozen): nested encodes via
-		// encodeNested() may have appended structures since entry, so this keeps
-		// typedStructs.length a hard bound rather than overshooting by nesting depth.
-		if (typedStructs.length >= (packr.maxOwnStructures ?? Infinity)) return null;
+		// Re-check the cap with a fresh length read: nested encodeNested() calls may have
+		// appended structures since entry, so this keeps typedStructs.length a hard bound.
+		if (typedStructs.length >= cap) return null;
 		recordId = typedStructs.length;
 		const structure = [];
 		let t = transition;
@@ -1159,11 +1165,9 @@ export function readStruct(src, position, srcEnd) {
  * Accepts the same Map format that msgpackr's struct.js produces.
  */
 export function onLoadedStructures(sharedData) {
-	// Replaying already-persisted structures must always fully rebuild the trie,
-	// regardless of maxOwnStructures — the cap only limits minting NEW structures
-	// during encode. _frozen is module-level and may be left true by a prior capped
-	// encode, so clear it here before the createTypeTransition rebuild below.
-	_frozen = false;
+	// Replaying already-persisted structures must always fully rebuild the trie, regardless of
+	// maxOwnStructures — the cap only limits minting NEW structures during encode. So the
+	// createTypeTransition rebuild below is called with frozen=false.
 	if (!sharedData) return this.structures;
 	let named, typed;
 	if (sharedData instanceof Map) {
@@ -1207,7 +1211,7 @@ export function onLoadedStructures(sharedData) {
 					float64: null, date64: null,
 				};
 			}
-			t = createTypeTransition(next, type, size);
+			t = createTypeTransition(next, type, size, false);
 		}
 		t[RECORD_SYMBOL] = i;
 	}
