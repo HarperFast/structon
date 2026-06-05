@@ -345,6 +345,19 @@ suite('structon (cbor-x base) – maxOwnStructures cap', function () {
 		assert.ok(enc.typedStructs.length <= 1, 'wide multi-ref records must not exceed the cap, got ' + enc.typedStructs.length);
 	});
 
+	test('capped: a single object ref past 0xff00 (via inline strings) stays bounded', function () {
+		const enc = new Structon({ structures: [], useRecords: false, maxOwnStructures: 1 });
+		const norm = (r) => JSON.parse(JSON.stringify(enc.decode(enc.encode(r))));
+		const small = 'a'.repeat(16319);
+		norm({ s1: small, s2: small, s3: small, s4: small, obj: { x: 1 } });
+		const big = 'a'.repeat(16320);
+		for (let i = 0; i < 20; i++) {
+			const r = { s1: big, s2: big, s3: big, s4: big, obj: { x: i } };
+			assert.deepStrictEqual(norm(r), r);
+		}
+		assert.ok(enc.typedStructs.length <= 1, 'wide-string single-ref records must not exceed the cap, got ' + enc.typedStructs.length);
+	});
+
 	test('new Structon(null) does not throw (null options = use defaults)', function () {
 		const enc = new Structon(null);
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(enc.decode(enc.encode({ a: 1 })))), { a: 1 });

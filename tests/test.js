@@ -644,6 +644,33 @@ suite('structon – maxOwnStructures cap', function () {
 		assert.ok(enc.typedStructs.length <= 1, 'wide multi-ref records must not exceed the cap, got ' + enc.typedStructs.length);
 	});
 
+	test('capped: a single object ref past 0xff00 (via inline strings) stays bounded', function () {
+		// Inline strings share the ref section, so even ONE object ref can land past 0xff00 and
+		// need object32. Under the cap such a record falls back to plain rather than minting.
+		const enc = new Structon({ structures: [], useRecords: false, maxOwnStructures: 1 });
+		const norm = (r) => JSON.parse(JSON.stringify(enc.decode(enc.encode(r))));
+		const small = 'a'.repeat(16319);
+		norm({ s1: small, s2: small, s3: small, s4: small, obj: { x: 1 } }); // object16, cap hit
+		const big = 'a'.repeat(16320); // 4 of these push the obj ref offset past 0xff00
+		for (let i = 0; i < 20; i++) {
+			const r = { s1: big, s2: big, s3: big, s4: big, obj: { x: i } };
+			assert.deepStrictEqual(norm(r), r);
+		}
+		assert.ok(enc.typedStructs.length <= 1, 'wide-string single-ref records must not exceed the cap, got ' + enc.typedStructs.length);
+	});
+
+	test('capped: a layout-retry record (large fixed section + nested refs) does not corrupt', function () {
+		// A large fixed section overflows the ref-start estimate and triggers an internal retry
+		// after refs were packed. The retry must re-encode the already-minted structure rather
+		// than bailing under the now-reached cap (which would corrupt the fallback).
+		const enc = new Structon({ structures: [], useRecords: false, maxOwnStructures: 1 });
+		const norm = (r) => JSON.parse(JSON.stringify(enc.decode(enc.encode(r))));
+		const mk = (base) => { const r = {}; for (let i = 0; i < 40; i++) r['n' + i] = base + i; r.a = { x: base }; r.b = { y: base + 1 }; return r; };
+		assert.deepStrictEqual(norm(mk(1000000)), mk(1000000));
+		assert.deepStrictEqual(norm(mk(2000000)), mk(2000000));
+		assert.ok(enc.typedStructs.length <= 1, 'retry-path records must not exceed the cap, got ' + enc.typedStructs.length);
+	});
+
 	test('new Structon(null) does not throw (null options = use defaults)', function () {
 		const enc = new Structon(null);
 		assert.deepStrictEqual(JSON.parse(JSON.stringify(enc.decode(enc.encode({ a: 1 })))), { a: 1 });
