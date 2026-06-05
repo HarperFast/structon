@@ -410,4 +410,28 @@ suite('structon (cbor-x base) – maxOwnStructures cap', function () {
 		assert.strictEqual(capped.typedStructs.length, 0, 'maxOwnStructures:0 must mint no typed structures');
 		assert.ok(uncapped.typedStructs.length > 0, 'the uncapped instance should still grow');
 	});
+
+	test('a capped miss does not double-read a side-effecting accessor', function () {
+		// A frozen miss on a new key must bail before the value is read, so the getter runs once
+		// (here) — not twice (failed struct attempt + plain fallback).
+		const enc = new Structon({ structures: [], useRecords: false, maxOwnStructures: 0 });
+		let reads = 0;
+		const obj = {};
+		Object.defineProperty(obj, 'a', { enumerable: true, get() { return ++reads; } });
+		const out = enc.decode(enc.encode(obj));
+		assert.strictEqual(reads, 1, 'accessor should be read exactly once');
+		assert.strictEqual((out.toJSON ? out.toJSON() : out).a, 1);
+	});
+
+	test('a getter that mints on the same encoder cannot push it past the cap', function () {
+		// The getter mints (via a re-entrant encode) after the entry-time freeze state is captured;
+		// the fresh cap re-check (preflight / record-id mint) must still bound typedStructs.
+		const enc = new Structon({ structures: [], useRecords: false, maxOwnStructures: 1 });
+		for (let k = 0; k < 10; k++) {
+			const obj = {};
+			Object.defineProperty(obj, 'a', { enumerable: true, get() { enc.encode({ ['z' + k]: k }); return { nested: k }; } });
+			enc.encode(obj);
+		}
+		assert.ok(enc.typedStructs.length <= 1, 'same-encoder getter mints must not exceed the cap, got ' + enc.typedStructs.length);
+	});
 });

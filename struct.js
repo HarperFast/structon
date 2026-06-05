@@ -280,7 +280,8 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 	// cap (which could otherwise bail after attempt 1 already packed refs → corrupt fallback).
 	// `frozen` is a local (from this instance's typedStructs) — never a shared global — so a
 	// re-entrant encode on another instance (e.g. via an enumerable getter) can't flip it.
-	const frozen = !structureKnown && typedStructs.length >= (packr.maxOwnStructures ?? Infinity);
+	const cap = packr.maxOwnStructures ?? Infinity;
+	const frozen = !structureKnown && typedStructs.length >= cap;
 	let targetView = target.dataView;
 	let refsStartPosition = (typedStructs.lastStringStart || 100) + position;
 	let safeEnd = target.length - 10;
@@ -311,8 +312,10 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 	let keyIndex = 0;
 
 	for (let key in object) {
-		let value = object[key];
 		let nextTransition = transition[key];
+		// Resolve the key transition BEFORE reading the value: when frozen and the key is new we
+		// bail here, so an enumerable getter isn't invoked during this (failed) struct attempt and
+		// then again by the plain fallback (which would double-read a side-effecting accessor).
 		if (!nextTransition) {
 			if (frozen) return 0;
 			transition[key] = nextTransition = {
@@ -322,6 +325,7 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 				float64: null, date64: null,
 			};
 		}
+		let value = object[key];
 		if (position > safeEnd) {
 			target = makeRoom(position);
 			targetView = target.dataView;
@@ -499,8 +503,9 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 	// shared write position and we cannot cleanly bail afterward, so preflight the whole queued
 	// chain through EXISTING transitions first: if the cap is reached and any field would need a
 	// new structure, fall back to plain encoding now (return 0) — before touching the shared
-	// position. Uses the local `frozen` (this instance's state), immune to cross-instance clobber.
-	if (frozen && queuedReferences.length > 0) {
+	// position. Uses a FRESH length read (not the entry-time `frozen`): a getter invoked while
+	// reading values above may have minted on this same instance since entry.
+	if (!structureKnown && queuedReferences.length > 0 && typedStructs.length >= cap) {
 		let t = transition;
 		for (let i = 0, l = queuedReferences.length; i < l; i += 3) {
 			// A non-null (object/Date) ref is pack()ed into the shared buffer, advancing
@@ -713,12 +718,14 @@ function _encode(object, encodeNested, packr, work) {
 	let structureUpdated = false;
 
 	for (const key in object) {
-		const value = object[key];
 		let nextTransition = transition[key];
+		// Resolve the key transition before reading the value, so a frozen miss on a new key bails
+		// without invoking an enumerable getter that the plain fallback would then read again.
 		if (!nextTransition) {
 			if (frozen) return null;
 			transition[key] = nextTransition = createBlankTransition(key, transition);
 		}
+		const value = object[key];
 		if (fixedPos + 8 > work.fixedBuf.length) _growFixed(work, fixedPos + 8);
 
 		switch (typeof value) {
