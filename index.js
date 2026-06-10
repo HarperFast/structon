@@ -107,7 +107,7 @@ export function createStructon(BaseClass) {
 				// _ensureTypedStructures may call getStructures which reads from the DB into
 				// the same reusable buffer — copy src before that can overwrite it
 				src = Uint8Array.prototype.slice.call(src, 0, srcEnd);
-				this._ensureTypedStructures();
+				this._ensureTypedStructures(recordId, srcEnd - start);
 				if (recordId !== -1 && this.typedStructs && this.typedStructs[recordId]) {
 					return readStruct.call(this, src, start, srcEnd);
 				}
@@ -133,8 +133,22 @@ export function createStructon(BaseClass) {
 			return _baseDecode.call(this, slice2);
 		}
 
-		_ensureTypedStructures() {
-			if (this.typedStructs && this.typedStructs.transitions) return;
+		_ensureTypedStructures(recordId, byteLength) {
+			// Load once if we have never loaded. Additionally, reload when a specific structure id was
+			// requested but is absent from our (possibly stale) cache: another encoder may have minted
+			// and persisted that structure after our last load. Without this, a once-populated cache
+			// never refreshes, and decode silently falls through to the base decoder for any structure
+			// added later — a record that exists comes back undecodable (HarperFast/harper#1163). The
+			// base decoder already reloads classic shared structures on a miss; this brings typed
+			// structures to parity.
+			if (this.typedStructs && this.typedStructs.transitions) {
+				if (recordId === undefined || recordId === -1 || this.typedStructs[recordId]) return;
+				// A single byte in the struct-header range (0x20-0x3f) is a base-encoded positive fixint
+				// (32-63), not a struct — a real struct record is always longer than its id header. Only
+				// reload for a multi-byte payload, so we never reload (and then mis-read) a pass-through
+				// integer whose value collides with an as-yet-unloaded structure id.
+				if (!(byteLength > 1)) return;
+			}
 			this._loadStructures();
 		}
 
