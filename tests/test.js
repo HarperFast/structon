@@ -723,3 +723,86 @@ suite('structon – maxOwnStructures cap', function () {
 		assert.ok(uncapped.typedStructs.length > 2, 'the uncapped sibling should grow past 2');
 	});
 });
+
+// ── typed structure reload-on-miss (standalone path) ───────────────────────────
+//
+// Regression for HarperFast/harper#1163: on the standalone path (a base without
+// SUPPORTS_STRUCT_HOOKS, e.g. msgpackr v1), a decoder that has already loaded its
+// typed structures once must still reload from durable storage when it encounters
+// a structure id it does not yet have — another encoder may have minted and
+// persisted that structure after the reader's last load. Previously the reader
+// short-circuited on `transitions` being set and never refreshed, so the record
+// (which exists) silently fell through to the base decoder.
+
+suite('structon – typed structure reload on miss (standalone, harper#1163)', function () {
+	const StandaloneStructon = createStructon(LegacyPackr); // v1.11: no struct hooks → standalone path
+
+	// Serialize the shared structures the way a real durable store does (encode to bytes on save,
+	// decode a fresh copy on load) so the reader gets an independent snapshot — not a live reference
+	// to the writer's structure array (which would auto-grow and mask staleness).
+	function durableStore() {
+		const meta = new Packr();
+		let buf = null;
+		let loads = 0;
+		return {
+			saveStructures(s) { buf = meta.encode(s); },
+			getStructures() { loads++; return buf ? meta.decode(buf) : undefined; },
+			get loads() { return loads; },
+		};
+	}
+
+	test('reader reloads when it hits a structure id minted after its last load', function () {
+		const store = durableStore();
+		const writer = new StandaloneStructon({ structures: [], saveStructures: store.saveStructures });
+		const reader = new StandaloneStructon({ structures: [], getStructures: store.getStructures });
+
+		// Writer mints structure for shape A; reader loads it and decodes (transitions now set).
+		const bufA = writer.encode({ a: 1, b: 2 });
+		assert.deepStrictEqual(materialize(reader.decode(bufA)), { a: 1, b: 2 });
+		const loadsAfterFirst = store.loads;
+		assert.ok(loadsAfterFirst >= 1, 'reader should have loaded structures at least once');
+
+		// Writer mints a NEW, differently-shaped structure (new id); durable store updated.
+		const bufB = writer.encode({ p: 'x', q: 'y', r: 'z' });
+
+		// Reader's cache is stale (snapshot knows only the first structure). It must reload to decode bufB.
+		const decoded = materialize(reader.decode(bufB));
+		assert.deepStrictEqual(decoded, { p: 'x', q: 'y', r: 'z' });
+		assert.ok(store.loads > loadsAfterFirst, 'reader should reload structures on the missing id (not short-circuit)');
+	});
+
+	test('a single-byte pass-through integer is not reloaded+mis-read as a struct (Codex P2-1)', function () {
+		// A bare positive fixint 32-63 shares the 0x20-0x3f struct-header byte range. The reload-on-miss
+		// must not fire for a one-byte payload — otherwise an integer whose value collides with an
+		// as-yet-unloaded structure id would be turned into a struct after the reload populates that id.
+		// (A real struct record is always longer than its one-byte id header.)
+		const store = durableStore();
+		const writer = new StandaloneStructon({ structures: [], saveStructures: store.saveStructures });
+		const reader = new StandaloneStructon({ structures: [], getStructures: store.getStructures });
+		// Reader loads ids 0 and 1 only.
+		writer.encode({ q: 1 });       // id 0
+		writer.encode({ r: 1, s: 2 }); // id 1
+		reader.decode(writer.encode({ q: 9 })); // reader cache now has ids 0,1 (transitions set)
+		// Writer mints id 2 AFTER the reader's load, so durable has id 2 but the reader's cache does not.
+		writer.encode({ t: 1, u: 2, v: 3 }); // id 2
+		// Integer 34 → byte 0x22 → recordId 2: absent in the reader's cache, present in durable. Decoding
+		// it must pass through to the base decoder (value 34), not reload and read it as struct id 2.
+		assert.strictEqual(reader.decode(reader.encode(34)), 34, 'integer 34 (id 2 in durable) must pass through');
+		// ids 18 and 31 are absent everywhere — also must pass through unchanged.
+		assert.strictEqual(reader.decode(reader.encode(50)), 50);
+		assert.strictEqual(reader.decode(reader.encode(63)), 63);
+	});
+
+	test('a present structure id does not trigger a reload', function () {
+		const store = durableStore();
+		const writer = new StandaloneStructon({ structures: [], saveStructures: store.saveStructures });
+		const reader = new StandaloneStructon({ structures: [], getStructures: store.getStructures });
+
+		const buf = writer.encode({ a: 1, b: 2 });
+		assert.deepStrictEqual(materialize(reader.decode(buf)), { a: 1, b: 2 }); // first load
+		const loads = store.loads;
+		// Re-decoding the same (already-known) structure must not reload.
+		assert.deepStrictEqual(materialize(reader.decode(buf)), { a: 1, b: 2 });
+		assert.strictEqual(store.loads, loads, 'a known structure id should not cause a reload');
+	});
+});
