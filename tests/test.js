@@ -217,6 +217,37 @@ suite('structon – structure persistence', function () {
 		assert.strictEqual(result.name, 'Bob');
 		assert.strictEqual(result.age, 25);
 	});
+
+	// Regression: _saveTypedStructures must forward isCompatible as the second arg so a saveStructures
+	// implementation can run its optimistic CAS. Dropping it let a concurrent same-length typed-struct
+	// save silently clobber the previous one (HarperFast/harper#1441). The fast-path encode goes through
+	// the base class's own saveStructures call (which already passes isCompatible), so we exercise
+	// _saveTypedStructures directly — the standalone-path call site this guards.
+	test('_saveTypedStructures forwards isCompatible as the second argument (harper#1441)', function () {
+		const calls = [];
+		const enc = new Structon({
+			structures: [],
+			saveStructures(structures, isCompatible) {
+				calls.push({ structures, isCompatible });
+				return true;
+			},
+		});
+
+		// Establish a typed struct so prepareStructures wraps {named, typed} and attaches isCompatible.
+		enc.encode({ name: 'Alice', age: 30 });
+		calls.length = 0; // ignore any saves from the encode path; we test _saveTypedStructures itself
+
+		enc._saveTypedStructures();
+
+		assert.strictEqual(calls.length, 1, '_saveTypedStructures should call saveStructures once');
+		const last = calls[0];
+		assert.strictEqual(typeof last.isCompatible, 'function', 'isCompatible must be forwarded as the second arg');
+		assert.strictEqual(
+			last.isCompatible,
+			last.structures.isCompatible,
+			'the forwarded isCompatible must be the one prepareStructures attached to the structures'
+		);
+	});
 });
 
 // ── binary compatibility with msgpackr's randomAccessStructure ──────────────
