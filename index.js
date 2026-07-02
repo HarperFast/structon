@@ -162,7 +162,13 @@ export function createStructon(BaseClass) {
 		_saveTypedStructures() {
 			if (typeof this.saveStructures === 'function') {
 				const structures = prepareStructures(this.structures || [], this);
-				this.saveStructures(structures);
+				// Forward isCompatible as the second arg, matching msgpackr's own pack call site
+				// (saveStructures(newSharedData, newSharedData.isCompatible)). prepareStructures attaches
+				// it to the returned structures; without forwarding it, a saveStructures implementation
+				// that runs an optimistic CAS on the parameter (e.g. Harper's RocksDB override) sees
+				// `undefined` and a concurrent same-length save silently clobbers the previously persisted
+				// struct. See HarperFast/harper#1441.
+				this.saveStructures(structures, structures.isCompatible);
 			} else if (typeof this.saveShared === 'function') {
 				this.saveShared({
 					structures: this.structures || [],
