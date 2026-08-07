@@ -69,26 +69,55 @@ export function createStructon(BaseClass) {
 
 		_structonEncode(value, encodeOptions, superEncode) {
 			if (value && typeof value === 'object' && value.constructor === Object) {
-				const prevLen = this.typedStructs.length;
-				let structuresUpdated = false;
-				this._onStructureAdded = () => { structuresUpdated = true; };
-				try {
-					const encoded = writeStruct(value, v => this.encode(v), this);
-					if (encoded !== null) {
-						if (structuresUpdated || this.typedStructs.length !== prevLen) {
-							this._saveTypedStructures();
+				// A struct encoding is a bare reference to a typed structure id, so it is only valid
+				// once that structure is durably saved. When saveStructures declines (a concurrent
+				// writer advanced the shared structures), reload and re-mint against the durable
+				// dictionary rather than returning bytes that point at an id nobody persisted — the
+				// same contract msgpackr's own pack call site enforces by re-packing on a declined
+				// save. One retry: the reload realigns us with durable, so a second decline means
+				// sustained contention, which we surface rather than paper over.
+				for (let attempt = 0; ; attempt++) {
+					const prevLen = this.typedStructs.length;
+					let structuresUpdated = false;
+					this._onStructureAdded = () => { structuresUpdated = true; };
+					try {
+						const encoded = writeStruct(value, v => this.encode(v), this);
+						if (encoded !== null) {
+							// On a retry, always re-attempt the save: the declined attempt means durable may
+							// not hold our dictionary at all, and the reload may not have changed it (an empty
+							// durable leaves our unpersisted mint in place), so "no new structure this pass"
+							// does not imply the referenced id is persisted.
+							if (attempt > 0 || structuresUpdated || this.typedStructs.length !== prevLen) {
+								if (this._saveTypedStructures() === false) {
+									if (attempt > 0) {
+										throw new Error(
+											'Unable to save typed structures: saveStructures declined twice, ' +
+											'the encoded structure id would not be persisted');
+									}
+									this._loadStructures();
+									continue;
+								}
+							}
+							return encoded;
 						}
-						return encoded;
+						// Capped miss: fall back to plain base encoding. The base may persist its own
+						// named structures via saveStructures, overwriting our combined {named, typed}
+						// payload and stranding previously written struct data. Re-save afterward so the
+						// typed structures survive (this.structures now also holds any base record added).
+						const result = superEncode(value, encodeOptions);
+						if (this.typedStructs && this.typedStructs.length > 0) {
+							// Best-effort: unlike the struct path above, `result` carries no typed-structure
+							// reference, so a declined re-save cannot strand this record — only previously
+							// written struct data. Reload and try once more, then return the (valid) bytes.
+							if (this._saveTypedStructures() === false && attempt === 0) {
+								this._loadStructures();
+								this._saveTypedStructures();
+							}
+						}
+						return result;
+					} finally {
+						this._onStructureAdded = null;
 					}
-					// Capped miss: fall back to plain base encoding. The base may persist its own
-					// named structures via saveStructures, overwriting our combined {named, typed}
-					// payload and stranding previously written struct data. Re-save afterward so the
-					// typed structures survive (this.structures now also holds any base record added).
-					const result = superEncode(value, encodeOptions);
-					if (this.typedStructs && this.typedStructs.length > 0) this._saveTypedStructures();
-					return result;
-				} finally {
-					this._onStructureAdded = null;
 				}
 			}
 			return superEncode(value, encodeOptions);
@@ -159,6 +188,11 @@ export function createStructon(BaseClass) {
 			if (sharedData) onLoadedStructures.call(this, sharedData);
 		}
 
+		/**
+		 * Persist the combined {named, typed} structures. Returns `false` when saveStructures
+		 * declined the save (CAS conflict or a non-durable commit); callers must not return an
+		 * encoding that references a structure id from a declined save.
+		 */
 		_saveTypedStructures() {
 			if (typeof this.saveStructures === 'function') {
 				const structures = prepareStructures(this.structures || [], this);
@@ -168,7 +202,7 @@ export function createStructon(BaseClass) {
 				// that runs an optimistic CAS on the parameter (e.g. Harper's RocksDB override) sees
 				// `undefined` and a concurrent same-length save silently clobbers the previously persisted
 				// struct. See HarperFast/harper#1441.
-				this.saveStructures(structures, structures.isCompatible);
+				return this.saveStructures(structures, structures.isCompatible);
 			} else if (typeof this.saveShared === 'function') {
 				this.saveShared({
 					structures: this.structures || [],

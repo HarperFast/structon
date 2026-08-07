@@ -837,3 +837,89 @@ suite('structon – typed structure reload on miss (standalone, harper#1163)', f
 		assert.strictEqual(store.loads, loads, 'a known structure id should not cause a reload');
 	});
 });
+
+// A struct encoding is a bare reference to a typed structure id, so it is only meaningful once that
+// structure is durably saved. When a CAS-ing saveStructures declines the save (a concurrent writer
+// advanced the shared structures), returning the encoded bytes as-is strands the record: it points at
+// an id that was never persisted, or — worse — at an id the winning writer assigned to a different
+// shape, so it decodes as another record's fields. msgpackr's own pack call site handles this by
+// re-packing on a declined save; the standalone path must do the same.
+
+suite('structon – declined structure save is retried (standalone)', function () {
+	const StandaloneStructon = createStructon(LegacyPackr); // v1.11: no struct hooks → standalone path
+
+	// A durable store with the optimistic CAS a real backing store runs (e.g. Harper's RocksDB
+	// RecordEncoder override): the save commits only if the caller's view of the existing structures
+	// is still current.
+	function casStore() {
+		const meta = new Packr();
+		let buf = null;
+		let saves = 0;
+		let declines = 0;
+		return {
+			saveStructures(s, isCompatible) {
+				const existing = buf ? meta.decode(buf) : undefined;
+				if (typeof isCompatible === 'function' && !isCompatible(existing)) {
+					declines++;
+					return false;
+				}
+				buf = meta.encode(s);
+				saves++;
+				return true;
+			},
+			getStructures() { return buf ? meta.decode(buf) : undefined; },
+			get saves() { return saves; },
+			get declines() { return declines; },
+		};
+	}
+
+	test('a record encoded against a declined save is re-minted against durable', function () {
+		const store = casStore();
+		const options = { structures: [], saveStructures: store.saveStructures, getStructures: store.getStructures };
+		const writerA = new StandaloneStructon(options);
+		const writerB = new StandaloneStructon(options);
+
+		// A mints and persists its shape first.
+		const bufA = writerA.encode({ a: 1, b: 2 });
+
+		// B still has an empty view, so its save is CAS-declined. It must reload, re-mint against the
+		// durable dictionary, and re-save — otherwise its bytes reference an id durable assigned to A's
+		// shape and decode as A's fields.
+		const bufB = writerB.encode({ p: 'x', q: 'y', r: 'z' });
+		assert.ok(store.declines >= 1, 'the stale writer\'s first save should have been CAS-declined');
+
+		const reader = new StandaloneStructon({ structures: [], getStructures: store.getStructures });
+		assert.deepStrictEqual(materialize(reader.decode(bufB)), { p: 'x', q: 'y', r: 'z' });
+		// The winning writer's record must survive the re-mint too.
+		assert.deepStrictEqual(materialize(reader.decode(bufA)), { a: 1, b: 2 });
+	});
+
+	test('a save that keeps being declined throws rather than returning stranded bytes', function () {
+		let calls = 0;
+		const enc = new StandaloneStructon({
+			structures: [],
+			saveStructures() { calls++; return false; },
+			getStructures() { return undefined; },
+		});
+
+		assert.throws(
+			() => enc.encode({ a: 1, b: 2 }),
+			/declined twice/,
+			'a persistently declined save must surface, not return a reference to an unpersisted structure'
+		);
+		assert.strictEqual(calls, 2, 'exactly one retry after the reload');
+	});
+
+	test('a committed save is unaffected (no reload, no retry)', function () {
+		const store = casStore();
+		const enc = new StandaloneStructon({
+			structures: [],
+			saveStructures: store.saveStructures,
+			getStructures: store.getStructures,
+		});
+		const buf = enc.encode({ a: 1, b: 2 });
+		assert.strictEqual(store.declines, 0);
+		assert.strictEqual(store.saves, 1);
+		assert.deepStrictEqual(materialize(enc.decode(buf)), { a: 1, b: 2 });
+	});
+});
