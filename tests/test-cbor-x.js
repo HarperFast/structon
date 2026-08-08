@@ -435,3 +435,54 @@ suite('structon (cbor-x base) – maxOwnStructures cap', function () {
 		assert.ok(enc.typedStructs.length <= 1, 'same-encoder getter mints must not exceed the cap, got ' + enc.typedStructs.length);
 	});
 });
+
+// cbor-x writes shared structures through the SAME consumer-supplied saveStructures callback that
+// structon uses, but in its own shape: SharedData {structures, packedValues, version} (encode.js
+// updateSharedData), versus structon's Map {named, typed}. A durable store can therefore be left
+// holding cbor-x's form — e.g. a capped plain-fallback where the base encode saved and structon's
+// re-save was then declined. onLoadedStructures must recognize it; reading it as the generic plain
+// object form finds no `named`/`typed` and silently clears the entire dictionary.
+
+suite('structon (cbor-x base) – reload from cbor-x SharedData form', function () {
+	// Capture a genuine SharedData instance from cbor-x's own save path rather than hand-building
+	// the shape, so the test tracks whatever cbor-x actually writes.
+	function captureSharedData() {
+		let captured = null;
+		const enc = new Structon({
+			structures: [],
+			maxOwnStructures: 1,
+			saveStructures(s) { if (s && !(s instanceof Map) && Array.isArray(s.structures)) captured = s; return true; },
+		});
+		enc.encode({ a: 1, b: 2 });              // mints a typed struct (cap = 1)
+		enc.encode({ p: 'x', q: 'y', r: 'z' });  // capped miss → base encode → cbor-x saves SharedData
+		assert.ok(captured, 'cbor-x should have written its SharedData form via saveStructures');
+		return captured;
+	}
+
+	test('cbor-x SharedData is recognized on reload and does not clear the dictionary', function () {
+		const sharedData = captureSharedData();
+		assert.ok(Array.isArray(sharedData.structures), 'captured payload should carry a structures array');
+		assert.strictEqual(sharedData.named, undefined, 'cbor-x form has no `named` key');
+
+		const enc = new Structon({ structures: [], getStructures() { return sharedData; } });
+		enc.encode({ a: 1, b: 2 });
+		const typedBefore = enc.typedStructs.length;
+		assert.ok(typedBefore > 0, 'encoder should hold a typed structure before the reload');
+
+		enc._loadStructures();
+
+		assert.strictEqual(enc.typedStructs.length, typedBefore,
+			'reloading cbor-x\'s named-only form must preserve typed structures, not clear them');
+		assert.deepStrictEqual(enc.structures.slice(), sharedData.structures,
+			'the named structures from the cbor-x form should be adopted');
+	});
+
+	test('records still decode after a reload from the cbor-x SharedData form', function () {
+		const sharedData = captureSharedData();
+		const enc = new Structon({ structures: [], getStructures() { return sharedData; } });
+		const buf = enc.encode({ a: 1, b: 2 });
+		enc._loadStructures();
+		const out = enc.decode(buf);
+		assert.deepStrictEqual(out.toJSON ? out.toJSON() : out, { a: 1, b: 2 });
+	});
+});

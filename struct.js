@@ -1185,10 +1185,21 @@ export function onLoadedStructures(sharedData) {
 		named = sharedData;
 		typed = this.typedStructs || [];
 	} else if (typeof sharedData === 'object') {
-		// Plain object form (e.g. a Map round-tripped through msgpackr with
-		// mapsAsObjects: true, which is the default).
-		named = sharedData.named || [];
-		typed = sharedData.typed || [];
+		if (!sharedData.named && !sharedData.typed && Array.isArray(sharedData.structures)) {
+			// cbor-x's SharedData ({structures, packedValues, version}). Its own updateSharedData
+			// writes this shape through the same consumer-supplied saveStructures we use, so a
+			// durable store can be left holding it (e.g. a capped plain-fallback whose base encode
+			// saved, then our re-save was declined). It carries named structures only — keep ours,
+			// same as the legacy bare-array form. Without this, the object branch below reads no
+			// `named`/`typed` and silently clears the whole dictionary.
+			named = sharedData.structures;
+			typed = this.typedStructs || [];
+		} else {
+			// Plain object form (e.g. a Map round-tripped through msgpackr with
+			// mapsAsObjects: true, which is the default).
+			named = sharedData.named || [];
+			typed = sharedData.typed || [];
+		}
 	} else {
 		return this.structures;
 	}
