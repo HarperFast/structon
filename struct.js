@@ -27,6 +27,7 @@ const float32Headers = [false, true, true, false, false, true, true, false];
 
 export const RECORD_SYMBOL = Symbol('record-id');
 export const SOURCE_SYMBOL = Symbol.for('source');
+const hasOwnProperty = Object.prototype.hasOwnProperty;
 
 // Tracks the source being decoded by a nested unpack call so that
 // `saveState` can detach it from the parent decoder's buffer state.
@@ -311,7 +312,17 @@ export function writeStructInPlace(object, target, encodingStart, position, stru
 	let usedAscii0 = false;
 	let keyIndex = 0;
 
+	// Own properties only, matching msgpackr's object writers (its map/record paths all guard with
+	// hasOwnProperty): an enumerable accessor a consumer put on the shared prototype is presentation,
+	// not data, and walking the chain would read it — executing the getter — and persist its result.
+	// The one legitimate inherited source of fields is a lazily-decoded struct instance, whose stored
+	// fields live as accessors on ITS OWN direct prototype (built in readStruct below and marked by
+	// the instance's SOURCE_SYMBOL); higher prototypes are still excluded.
+	const decodedFieldsPrototype = object[SOURCE_SYMBOL] ? Object.getPrototypeOf(object) : null;
 	for (let key in object) {
+		if (!hasOwnProperty.call(object, key) &&
+			(decodedFieldsPrototype === null || !hasOwnProperty.call(decodedFieldsPrototype, key)))
+			continue;
 		let nextTransition = transition[key];
 		// Resolve the key transition BEFORE reading the value: when frozen and the key is new we
 		// bail here, so an enumerable getter isn't invoked during this (failed) struct attempt and
@@ -717,7 +728,12 @@ function _encode(object, encodeNested, packr, work) {
 	let keyIndex = 0;
 	let structureUpdated = false;
 
+	// Own properties only — same rule and rationale as writeStructInPlace above.
+	const decodedFieldsPrototype = object[SOURCE_SYMBOL] ? Object.getPrototypeOf(object) : null;
 	for (const key in object) {
+		if (!hasOwnProperty.call(object, key) &&
+			(decodedFieldsPrototype === null || !hasOwnProperty.call(decodedFieldsPrototype, key)))
+			continue;
 		let nextTransition = transition[key];
 		// Resolve the key transition before reading the value, so a frozen miss on a new key bails
 		// without invoking an enumerable getter that the plain fallback would then read again.

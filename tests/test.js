@@ -923,3 +923,61 @@ suite('structon – declined structure save is retried (standalone)', function (
 		assert.deepStrictEqual(materialize(enc.decode(buf)), { a: 1, b: 2 });
 	});
 });
+
+// ── own-property write semantics ─────────────────────────────────────────────
+// msgpackr's own object writers all guard enumeration with hasOwnProperty; struct encoding must
+// match, or an enumerable accessor a consumer installs on the shared structPrototype (a response
+// projection, a computed field) gets EXECUTED during encode and its result written as stored data.
+// The one legitimate inherited source of fields is a lazily-decoded struct instance, whose stored
+// fields live as accessors on its own direct prototype.
+
+suite('structon – own-property write semantics', function () {
+	test('an enumerable accessor on the shared structPrototype is not encoded', function () {
+		class RecordBase {}
+		let resolverCalls = 0;
+		Object.defineProperty(RecordBase.prototype, 'resolved', {
+			get() {
+				resolverCalls++;
+				return 'presentation only';
+			},
+			enumerable: true,
+			configurable: true,
+		});
+		const enc = new Structon({ structures: [], randomAccessStructure: true, structPrototype: RecordBase.prototype });
+		const record = Object.assign(new RecordBase(), { id: 1, name: 'stored' });
+		const decoded = materialize(roundtrip(enc, record));
+		assert.deepStrictEqual({ ...decoded }, { id: 1, name: 'stored' });
+		assert.strictEqual(resolverCalls, 0, 'the accessor must not run during encode');
+	});
+
+	test('a lazily-decoded instance re-encodes every stored field', function () {
+		const enc = new Structon({ structures: [], randomAccessStructure: true });
+		const decoded = roundtrip(enc, { id: 'k1', name: 'first', count: 42 });
+		const again = materialize(roundtrip(enc, decoded));
+		assert.deepStrictEqual({ ...again }, { id: 'k1', name: 'first', count: 42 });
+	});
+
+	test('an own-key mutation on a decoded instance survives re-encode', function () {
+		const enc = new Structon({ structures: [], randomAccessStructure: true });
+		const decoded = roundtrip(enc, { id: 'k2', name: 'before', count: 1 });
+		decoded.name = 'after';
+		const again = materialize(roundtrip(enc, decoded));
+		assert.strictEqual(again.name, 'after');
+		assert.strictEqual(again.count, 1);
+	});
+
+	test('a decoded instance under a shared structPrototype re-encodes fields but not the prototype accessor', function () {
+		class RecordBase {}
+		Object.defineProperty(RecordBase.prototype, 'resolved', {
+			get() {
+				return 'presentation only';
+			},
+			enumerable: true,
+			configurable: true,
+		});
+		const enc = new Structon({ structures: [], randomAccessStructure: true, structPrototype: RecordBase.prototype });
+		const decoded = roundtrip(enc, Object.assign(new RecordBase(), { id: 3, name: 'stored' }));
+		const again = materialize(roundtrip(enc, decoded));
+		assert.deepStrictEqual({ ...again }, { id: 3, name: 'stored' });
+	});
+});
