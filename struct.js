@@ -1294,5 +1294,27 @@ export function prepareStructures(structures, packr) {
 		return ok;
 	};
 	packr.lastTypedStructuresLength = packr.typedStructs && packr.typedStructs.length;
+	guardSaveStructures(packr);
 	return structures;
+}
+
+const SAVE_GUARD = Symbol('structon-save-guard');
+
+// msgpackr reloads after a save that returns false, but not after one that throws, which would leave
+// ids from the failed save in use. Wrap at save time: a consumer (e.g. Harper's RecordEncoder) may
+// replace saveStructures after construction. Flag only after the throw, so a save that re-enters
+// pack (lmdb-js encodes the structures with this encoder) does not reload mid-save.
+function guardSaveStructures(packr) {
+	const save = packr.saveStructures;
+	if (typeof save !== 'function' || save[SAVE_GUARD]) return;
+	const guarded = function (structures, isCompatible) {
+		try {
+			return save.call(this, structures, isCompatible);
+		} catch (error) {
+			if (typeof packr.getStructures === 'function' && packr.structures) packr.structures.uninitialized = true;
+			throw error;
+		}
+	};
+	guarded[SAVE_GUARD] = true;
+	packr.saveStructures = guarded;
 }

@@ -933,10 +933,14 @@ suite('structon – absent shared structures (fast path)', function () {
 	function casStore() {
 		const meta = new Packr();
 		let buf = null;
-		let reads = 0, saves = 0, declines = 0, abortSaves = 0;
+		let reads = 0, saves = 0, declines = 0, abortSaves = 0, throwNext = false;
 		return {
 			getStructures() { reads++; return buf ? meta.decode(buf) : undefined; },
 			saveStructures(s, isCompatible) {
+				if (throwNext) {
+					throwNext = false;
+					throw new Error('store error');
+				}
 				const existing = buf ? meta.decode(buf) : undefined;
 				const aborted = abortSaves > 0;
 				if (aborted) abortSaves--;
@@ -950,6 +954,7 @@ suite('structon – absent shared structures (fast path)', function () {
 			},
 			remove() { buf = null; },
 			abortSaves(count) { abortSaves = count; },
+			throwNextSave() { throwNext = true; },
 			get reads() { return reads; },
 			get saves() { return saves; },
 			get declines() { return declines; },
@@ -997,6 +1002,33 @@ suite('structon – absent shared structures (fast path)', function () {
 		store.abortSaves(Infinity);
 		assert.throws(() => enc.encode({ a: 1, b: 2 }));
 		assert.strictEqual(store.saves, 0);
+	});
+
+	test('a first save that throws is not reused once another writer creates the record', function () {
+		const store = casStore();
+		const enc = encoderFor(store);
+		store.throwNextSave();
+		assert.throws(() => enc.encode({ a: 1, b: 2 }), /store error/);
+
+		const other = encoderFor(store);
+		const otherTyped = other.encode({ p: 3, q: 4 });
+
+		const retried = enc.encode({ a: 5, b: 6 });
+		const later = enc.encode({ s: 7, t: 8 });
+		const reader = encoderFor(store);
+		assert.deepStrictEqual(materialize(reader.decode(retried)), { a: 5, b: 6 });
+		assert.deepStrictEqual(materialize(reader.decode(later)), { s: 7, t: 8 });
+		assert.deepStrictEqual(materialize(reader.decode(otherTyped)), { p: 3, q: 4 });
+	});
+
+	test('a first save that throws is re-minted and saved on the next encode', function () {
+		const store = casStore();
+		const enc = encoderFor(store);
+		store.throwNextSave();
+		assert.throws(() => enc.encode({ a: 1, b: 2 }), /store error/);
+		const buf = enc.encode({ a: 3, b: 4 });
+		assert.strictEqual(store.saves, 1);
+		assert.deepStrictEqual(materialize(encoderFor(store).decode(buf)), { a: 3, b: 4 });
 	});
 
 	test('an encoder that loaded an absent record reloads on a decode miss once the record is re-created', function () {
