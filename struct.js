@@ -1317,6 +1317,8 @@ function guardSaveStructures(packr) {
 		try {
 			return save.apply(this, args);
 		} catch (error) {
+			// Arm the reload before the reset, which can itself overflow when the throw is a stack overflow.
+			if (this.structures) this.structures.uninitialized = true;
 			// Drop the unsaved ids too, so a decode misses and reloads rather than reading them.
 			onLoadedStructures.call(this, undefined);
 			this.structures.uninitialized = true;
