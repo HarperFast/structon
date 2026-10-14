@@ -1054,6 +1054,18 @@ suite('structon – absent shared structures (fast path)', function () {
 		assert.deepStrictEqual(reader.decode(otherClassic), [{ p: 3, q: 4 }]);
 	});
 
+	test('a save that encodes with the same encoder does not reload mid-save', function () {
+		let buf = null, reads = 0;
+		const enc = new Structon({
+			getStructures() { reads++; return buf ? enc.decode(buf) : undefined; },
+			saveStructures(s) { buf = Buffer.from(enc.encode(s)); return true; },
+		});
+		const record = enc.encode({ a: 1, b: 2 });
+		assert.strictEqual(reads, 1);
+		const reader = new Structon({ getStructures() { return buf ? reader.decode(buf) : undefined; } });
+		assert.deepStrictEqual(materialize(reader.decode(record)), { a: 1, b: 2 });
+	});
+
 	test('a first save that throws is re-minted and saved on the next encode', function () {
 		const store = casStore();
 		const enc = encoderFor(store);

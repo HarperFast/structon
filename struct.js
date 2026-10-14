@@ -1296,7 +1296,7 @@ export function prepareStructures(structures, packr) {
 	packr.lastTypedStructuresLength = packr.typedStructs && packr.typedStructs.length;
 	// The ids just minted are not durable until the save returns. msgpackr reloads after a save that
 	// returns false, but not when encoding fails before the save or the save throws.
-	if (typeof packr.getStructures === 'function' && packr.structures) {
+	if (typeof packr.getStructures === 'function' && typeof packr.saveStructures === 'function' && packr.structures) {
 		packr.structures.uninitialized = true;
 		guardSaveStructures(packr);
 	}
