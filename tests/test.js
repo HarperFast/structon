@@ -924,6 +924,115 @@ suite('structon – declined structure save is retried (standalone)', function (
 	});
 });
 
+// ── absent shared structures (fast path) ─────────────────────────────────────
+//
+// A store that never saves a structure (e.g. a secondary index whose values are all null) has no
+// shared-structures record, so getStructures returns undefined. Loading that must leave the encoder
+// initialized with an empty dictionary. Returning the previous array kept msgpackr's `uninitialized`
+// flag set, and every pack re-read the absent record: one storage read per index write.
+
+suite('structon – absent shared structures (fast path)', function () {
+	// Durable store with the optimistic CAS a real backing store runs. `abortNextSave` models a write
+	// transaction that aborts: the save is declined and nothing is persisted.
+	function casStore() {
+		const meta = new Packr();
+		let buf = null;
+		let reads = 0, saves = 0, declines = 0, abortNextSave = false;
+		return {
+			getStructures() { reads++; return buf ? meta.decode(buf) : undefined; },
+			saveStructures(s, isCompatible) {
+				if (abortNextSave) {
+					abortNextSave = false;
+					declines++;
+					return false;
+				}
+				const existing = buf ? meta.decode(buf) : undefined;
+				if (typeof isCompatible === 'function' && !isCompatible(existing)) {
+					declines++;
+					return false;
+				}
+				buf = meta.encode(s);
+				saves++;
+				return true;
+			},
+			remove() { buf = null; },
+			abortNextSave() { abortNextSave = true; },
+			get reads() { return reads; },
+			get saves() { return saves; },
+			get declines() { return declines; },
+		};
+	}
+	const encoderFor = store => new Structon({ getStructures: store.getStructures, saveStructures: store.saveStructures });
+
+	test('encodes against a store with no shared structures read it once', function () {
+		const store = casStore();
+		const enc = encoderFor(store);
+		for (let i = 0; i < 100; i++) enc.encode(null);
+		assert.strictEqual(store.reads, 1, 'the absent record should be read once, not on every encode');
+
+		// The empty load is a real load: the first structure still saves and stays decodable.
+		const buf = enc.encode({ a: 1, b: [{ c: 2 }] });
+		assert.strictEqual(store.saves, 1);
+		assert.strictEqual(store.reads, 1);
+		assert.deepStrictEqual(materialize(encoderFor(store).decode(buf)), { a: 1, b: [{ c: 2 }] });
+	});
+
+	test('a declined first typed-structure save is re-minted and re-saved', function () {
+		const store = casStore();
+		const enc = encoderFor(store);
+		store.abortNextSave();
+		const buf = enc.encode({ a: 1, b: 2 });
+		assert.strictEqual(store.declines, 1);
+		assert.strictEqual(store.saves, 1, 'the re-pack must save the structure the record references');
+		assert.deepStrictEqual(materialize(encoderFor(store).decode(buf)), { a: 1, b: 2 });
+	});
+
+	test('a declined first classic-structure save is re-minted and re-saved', function () {
+		const store = casStore();
+		const enc = encoderFor(store);
+		store.abortNextSave();
+		const buf = enc.encode([{ x: 1, y: 2 }]);
+		assert.strictEqual(store.declines, 1);
+		assert.strictEqual(store.saves, 1);
+		assert.deepStrictEqual(encoderFor(store).decode(buf), [{ x: 1, y: 2 }]);
+	});
+
+	test('an encoder that loaded a deleted record does not act on its empty view once the record is re-created', function () {
+		const store = casStore();
+		encoderFor(store).encode({ old: 1 });
+		store.remove(); // e.g. the store was cleared
+
+		const stale = encoderFor(store);
+		stale.encode(null); // loads the absent record: initialized, empty
+		const readsAfterLoad = store.reads;
+
+		// Another writer re-creates the record with its own typed and classic structures.
+		const other = encoderFor(store);
+		const otherTyped = other.encode({ p: 'x', q: 'y' });
+		const otherClassic = other.encode([{ r: 1 }]);
+
+		// The stale writer mints against its empty view. Its save must be CAS-declined so it reloads
+		// and re-mints after the re-created structures, rather than overwriting them.
+		const declinesBefore = store.declines;
+		const staleTyped = stale.encode({ s: 1, t: 2 });
+		const staleClassic = stale.encode([{ u: 1, v: 2 }]);
+		const staleReusesOther = stale.encode({ p: 'z', q: 'w' });
+		assert.ok(store.declines > declinesBefore, 'the save against the empty view should have been declined');
+		assert.ok(store.reads > readsAfterLoad, 'the declined save should reload the durable record');
+
+		const reader = encoderFor(store);
+		assert.deepStrictEqual(materialize(reader.decode(otherTyped)), { p: 'x', q: 'y' });
+		assert.deepStrictEqual(reader.decode(otherClassic), [{ r: 1 }]);
+		assert.deepStrictEqual(materialize(reader.decode(staleTyped)), { s: 1, t: 2 });
+		assert.deepStrictEqual(reader.decode(staleClassic), [{ u: 1, v: 2 }]);
+		assert.deepStrictEqual(materialize(reader.decode(staleReusesOther)), { p: 'z', q: 'w' });
+
+		// The stale encoder also decodes the other writer's records: a miss reloads.
+		assert.deepStrictEqual(materialize(stale.decode(otherTyped)), { p: 'x', q: 'y' });
+		assert.deepStrictEqual(stale.decode(otherClassic), [{ r: 1 }]);
+	});
+});
+
 // ── own-property write semantics ─────────────────────────────────────────────
 // msgpackr's own object writers all guard enumeration with hasOwnProperty; struct encoding must
 // match, or an enumerable accessor a consumer installs on the shared structPrototype (a response

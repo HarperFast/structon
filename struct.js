@@ -1191,9 +1191,15 @@ export function onLoadedStructures(sharedData) {
 	// Replaying already-persisted structures must always fully rebuild the trie, regardless of
 	// maxOwnStructures — the cap only limits minting NEW structures during encode. So the
 	// createTypeTransition rebuild below is called with frozen=false.
-	if (!sharedData) return this.structures;
 	let named, typed;
-	if (sharedData instanceof Map) {
+	if (!sharedData) {
+		// Nothing is persisted, so the durable dictionary is empty. Load it as such: returning the
+		// previous array would keep msgpackr's `uninitialized` flag (a getStructures read on every
+		// pack), and keeping in-memory typed structs would let the re-pack after a declined first
+		// save reuse an unpersisted structure id instead of re-minting and re-saving it.
+		named = [];
+		typed = [];
+	} else if (sharedData instanceof Map) {
 		named = sharedData.get('named') || [];
 		typed = sharedData.get('typed') || [];
 	} else if (Array.isArray(sharedData)) {
