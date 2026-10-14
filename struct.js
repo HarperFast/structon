@@ -1191,9 +1191,13 @@ export function onLoadedStructures(sharedData) {
 	// Replaying already-persisted structures must always fully rebuild the trie, regardless of
 	// maxOwnStructures — the cap only limits minting NEW structures during encode. So the
 	// createTypeTransition rebuild below is called with frozen=false.
-	if (!sharedData) return this.structures;
 	let named, typed;
-	if (sharedData instanceof Map) {
+	if (!sharedData) {
+		// In-memory structures may hold ids from a declined save. Return a new array: msgpackr's
+		// `uninitialized` flag lives on the old one.
+		named = [];
+		typed = [];
+	} else if (sharedData instanceof Map) {
 		named = sharedData.get('named') || [];
 		typed = sharedData.get('typed') || [];
 	} else if (Array.isArray(sharedData)) {
@@ -1290,5 +1294,38 @@ export function prepareStructures(structures, packr) {
 		return ok;
 	};
 	packr.lastTypedStructuresLength = packr.typedStructs && packr.typedStructs.length;
+	// The ids just minted are not durable until the save returns. msgpackr reloads after a save that
+	// returns false, but not when encoding fails before the save or the save throws.
+	if (typeof packr.getStructures === 'function' && typeof packr.saveStructures === 'function' && packr.structures) {
+		packr.structures.uninitialized = true;
+		guardSaveStructures(packr);
+	}
 	return structures;
+}
+
+const SAVE_GUARD = Symbol('structon-save-guard');
+
+// Wrapped at save time: a consumer (e.g. Harper's RecordEncoder) may replace saveStructures after
+// construction.
+function guardSaveStructures(packr) {
+	const save = packr.saveStructures;
+	if (typeof save !== 'function' || save[SAVE_GUARD]) return;
+	const guarded = function (...args) {
+		// A save may re-enter pack (lmdb-js encodes the structures with this encoder), which must not
+		// reload mid-save.
+		if (this.structures) this.structures.uninitialized = false;
+		try {
+			return save.apply(this, args);
+		} catch (error) {
+			// Drop the unsaved ids too, so a decode misses and reloads rather than reading them. The reset
+			// can itself overflow when the save's error is a stack overflow; the reload is armed regardless.
+			try {
+				onLoadedStructures.call(this, undefined);
+			} catch {}
+			if (this.structures) this.structures.uninitialized = true;
+			throw error;
+		}
+	};
+	guarded[SAVE_GUARD] = true;
+	packr.saveStructures = guarded;
 }
