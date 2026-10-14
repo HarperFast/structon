@@ -1021,6 +1021,39 @@ suite('structon – absent shared structures (fast path)', function () {
 		assert.deepStrictEqual(materialize(reader.decode(otherTyped)), { p: 3, q: 4 });
 	});
 
+	test('a first save that throws does not leave its ids for decode', function () {
+		const store = casStore();
+		const typedEnc = encoderFor(store);
+		const classicEnc = encoderFor(store);
+		store.throwNextSave();
+		assert.throws(() => typedEnc.encode({ a: 1, b: 2 }), /store error/);
+		store.throwNextSave();
+		assert.throws(() => classicEnc.encode([{ a: 1, b: 2 }]), /store error/);
+
+		const other = encoderFor(store);
+		const otherTyped = other.encode({ p: 3, q: 4 });
+		const otherClassic = other.encode([{ p: 3, q: 4 }]);
+		assert.deepStrictEqual(materialize(typedEnc.decode(otherTyped)), { p: 3, q: 4 });
+		assert.deepStrictEqual(classicEnc.decode(otherClassic), [{ p: 3, q: 4 }]);
+	});
+
+	test('an encoding error after a structure is minted is not reused once another writer creates the record', function () {
+		const store = casStore();
+		const enc = encoderFor(store);
+		enc.encode(null);
+		const failing = { get boom() { throw new Error('encode error'); } };
+		assert.throws(() => enc.encode([{ x: 1, y: 2 }, failing]), /encode error/);
+		assert.strictEqual(store.saves, 0);
+
+		const other = encoderFor(store);
+		const otherClassic = other.encode([{ p: 3, q: 4 }]);
+
+		const retried = enc.encode([{ x: 5, y: 6 }]);
+		const reader = encoderFor(store);
+		assert.deepStrictEqual(reader.decode(retried), [{ x: 5, y: 6 }]);
+		assert.deepStrictEqual(reader.decode(otherClassic), [{ p: 3, q: 4 }]);
+	});
+
 	test('a first save that throws is re-minted and saved on the next encode', function () {
 		const store = casStore();
 		const enc = encoderFor(store);

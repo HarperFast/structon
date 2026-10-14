@@ -1294,24 +1294,32 @@ export function prepareStructures(structures, packr) {
 		return ok;
 	};
 	packr.lastTypedStructuresLength = packr.typedStructs && packr.typedStructs.length;
-	guardSaveStructures(packr);
+	// The ids just minted are not durable until the save returns. msgpackr reloads after a save that
+	// returns false, but not when encoding fails before the save or the save throws.
+	if (typeof packr.getStructures === 'function' && packr.structures) {
+		packr.structures.uninitialized = true;
+		guardSaveStructures(packr);
+	}
 	return structures;
 }
 
 const SAVE_GUARD = Symbol('structon-save-guard');
 
-// msgpackr reloads after a save that returns false, but not after one that throws, which would leave
-// ids from the failed save in use. Wrap at save time: a consumer (e.g. Harper's RecordEncoder) may
-// replace saveStructures after construction. Flag only after the throw, so a save that re-enters
-// pack (lmdb-js encodes the structures with this encoder) does not reload mid-save.
+// Wrapped at save time: a consumer (e.g. Harper's RecordEncoder) may replace saveStructures after
+// construction.
 function guardSaveStructures(packr) {
 	const save = packr.saveStructures;
 	if (typeof save !== 'function' || save[SAVE_GUARD]) return;
-	const guarded = function (structures, isCompatible) {
+	const guarded = function (...args) {
+		// A save may re-enter pack (lmdb-js encodes the structures with this encoder), which must not
+		// reload mid-save.
+		if (this.structures) this.structures.uninitialized = false;
 		try {
-			return save.call(this, structures, isCompatible);
+			return save.apply(this, args);
 		} catch (error) {
-			if (typeof packr.getStructures === 'function' && packr.structures) packr.structures.uninitialized = true;
+			// Drop the unsaved ids too, so a decode misses and reloads rather than reading them.
+			onLoadedStructures.call(this, undefined);
+			this.structures.uninitialized = true;
 			throw error;
 		}
 	};
