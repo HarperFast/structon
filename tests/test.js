@@ -1021,6 +1021,24 @@ suite('structon – absent shared structures (fast path)', function () {
 		assert.deepStrictEqual(materialize(reader.decode(otherTyped)), { p: 3, q: 4 });
 	});
 
+	test('a save that throws on an encoder with saved structures keeps the saved ones readable', function () {
+		const store = casStore();
+		const enc = encoderFor(store);
+		const saved = enc.encode({ a: 1, b: 2 });
+		store.throwNextSave();
+		assert.throws(() => enc.encode({ c: 3, d: 4 }), /store error/);
+
+		const other = encoderFor(store);
+		const otherTyped = other.encode({ e: 5, f: 6 });
+		assert.deepStrictEqual(materialize(enc.decode(otherTyped)), { e: 5, f: 6 });
+		const retried = enc.encode({ c: 7, d: 8 });
+
+		const reader = encoderFor(store);
+		assert.deepStrictEqual(materialize(reader.decode(saved)), { a: 1, b: 2 });
+		assert.deepStrictEqual(materialize(reader.decode(otherTyped)), { e: 5, f: 6 });
+		assert.deepStrictEqual(materialize(reader.decode(retried)), { c: 7, d: 8 });
+	});
+
 	test('a first save that throws does not leave its ids for decode', function () {
 		const store = casStore();
 		const typedEnc = encoderFor(store);
