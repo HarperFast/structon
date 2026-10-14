@@ -926,8 +926,8 @@ suite('structon – declined structure save is retried (standalone)', function (
 
 // ── absent shared structures (fast path) ─────────────────────────────────────
 //
-// A store that never saves a structure (e.g. a secondary index whose values are all null) has no
-// shared-structures record. Loading it must leave the encoder initialized with an empty dictionary.
+// A store that never saves a structure (e.g. a secondary index whose values are all null) never has a
+// shared-structures record.
 
 suite('structon – absent shared structures (fast path)', function () {
 	function casStore() {
@@ -995,8 +995,8 @@ suite('structon – absent shared structures (fast path)', function () {
 	});
 
 	test('a first save that is always declined throws instead of returning an unreadable record', function () {
-		// msgpackr re-packs after every declined save without a retry bound, so this ends in a
-		// RangeError, the same as when the record exists.
+		// msgpackr re-packs after every declined save without a retry bound, so any error is accepted
+		// here; it is a stack overflow today, the same as when the record exists.
 		const store = casStore();
 		const enc = encoderFor(store);
 		store.abortSaves(Infinity);
