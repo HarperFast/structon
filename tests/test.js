@@ -927,12 +927,9 @@ suite('structon – declined structure save is retried (standalone)', function (
 // ── absent shared structures (fast path) ─────────────────────────────────────
 //
 // A store that never saves a structure (e.g. a secondary index whose values are all null) has no
-// shared-structures record, so getStructures returns undefined. Loading that must leave the encoder
-// initialized with an empty dictionary. Returning the previous array kept msgpackr's `uninitialized`
-// flag set, and every pack re-read the absent record: one storage read per index write.
+// shared-structures record. Loading it must leave the encoder initialized with an empty dictionary.
 
 suite('structon – absent shared structures (fast path)', function () {
-	// A declined save persists nothing, like an aborted write transaction.
 	function casStore() {
 		const meta = new Packr();
 		let buf = null;
