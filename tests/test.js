@@ -991,7 +991,7 @@ suite('structon – absent shared structures (fast path)', function () {
 
 	test('a first save that is always declined throws instead of returning an unreadable record', function () {
 		// msgpackr re-packs after every declined save without a retry bound, so this ends in a
-		// RangeError — the same as when the record exists. What matters is that no bytes escape.
+		// RangeError, the same as when the record exists.
 		const store = casStore();
 		const enc = encoderFor(store);
 		store.abortSaves(Infinity);

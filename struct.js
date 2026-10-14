@@ -1193,8 +1193,8 @@ export function onLoadedStructures(sharedData) {
 	// createTypeTransition rebuild below is called with frozen=false.
 	let named, typed;
 	if (!sharedData) {
-		// Nothing is persisted, so load an empty dictionary. In-memory structures may hold ids from a
-		// declined save, and msgpackr clears its `uninitialized` flag only when handed a new array.
+		// In-memory structures may hold ids from a declined save. Return a new array: msgpackr's
+		// `uninitialized` flag lives on the old one.
 		named = [];
 		typed = [];
 	} else if (sharedData instanceof Map) {
