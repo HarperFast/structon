@@ -1192,6 +1192,11 @@ export function onLoadedStructures(sharedData) {
 	// maxOwnStructures — the cap only limits minting NEW structures during encode. So the
 	// createTypeTransition rebuild below is called with frozen=false.
 	let named, typed;
+	// Shared data holding named structures only is durable truth on the fast path: msgpackr saves
+	// through prepareStructures, which writes typed ones whenever they exist, so any local typed
+	// structures were never saved. A standalone base can overwrite saved typed structures with its own
+	// named-only save, so there the local ones are kept for the re-save to restore.
+	const localTyped = this._prepareStructures === prepareStructures ? [] : this.typedStructs || [];
 	if (!sharedData) {
 		// In-memory structures may hold ids from a declined save. Return a new array: msgpackr's
 		// `uninitialized` flag lives on the old one.
@@ -1203,7 +1208,7 @@ export function onLoadedStructures(sharedData) {
 	} else if (Array.isArray(sharedData)) {
 		// Legacy form: just the named structures array.
 		named = sharedData;
-		typed = this.typedStructs || [];
+		typed = localTyped;
 	} else if (typeof sharedData === 'object') {
 		if (!sharedData.named && !sharedData.typed && Array.isArray(sharedData.structures)) {
 			// cbor-x's SharedData ({structures, packedValues, version}). Its own updateSharedData
@@ -1213,7 +1218,7 @@ export function onLoadedStructures(sharedData) {
 			// same as the legacy bare-array form. Without this, the object branch below reads no
 			// `named`/`typed` and silently clears the whole dictionary.
 			named = sharedData.structures;
-			typed = this.typedStructs || [];
+			typed = localTyped;
 		} else {
 			// Plain object form (e.g. a Map round-tripped through msgpackr with
 			// mapsAsObjects: true, which is the default).
