@@ -1094,6 +1094,33 @@ suite('structon – absent shared structures (fast path)', function () {
 		assert.deepStrictEqual(materialize(encoderFor(store).decode(buf)), { a: 3, b: 4 });
 	});
 
+	test('a declined typed-structure save against classic-only structures is re-minted and re-saved', function () {
+		const store = casStore();
+		const classic = encoderFor(store).encode([{ x: 1 }]);
+		const enc = encoderFor(store);
+		enc.encode(null);
+		store.abortSaves(1);
+		const buf = enc.encode({ a: 1, b: 2 });
+		assert.strictEqual(store.declines, 1);
+		assert.strictEqual(store.saves, 2, 'the re-pack must save the structure the record references');
+		const reader = encoderFor(store);
+		assert.deepStrictEqual(materialize(reader.decode(buf)), { a: 1, b: 2 });
+		assert.deepStrictEqual(reader.decode(classic), [{ x: 1 }]);
+	});
+
+	test('a typed-structure save that loses a race to a classic-only save is re-minted and re-saved', function () {
+		const store = casStore();
+		const enc = encoderFor(store);
+		enc.encode(null);
+		const classic = encoderFor(store).encode([{ x: 1 }]);
+		const buf = enc.encode({ a: 1, b: 2 });
+		assert.strictEqual(store.declines, 1);
+		assert.strictEqual(store.saves, 2, 'the re-pack must save the structure the record references');
+		const reader = encoderFor(store);
+		assert.deepStrictEqual(materialize(reader.decode(buf)), { a: 1, b: 2 });
+		assert.deepStrictEqual(reader.decode(classic), [{ x: 1 }]);
+	});
+
 	test('an encoder that loaded an absent record reloads on a decode miss once the record is re-created', function () {
 		const store = casStore();
 		encoderFor(store).encode({ old: 1 });
